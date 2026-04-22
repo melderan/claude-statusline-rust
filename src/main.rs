@@ -3,7 +3,15 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 use std::io::Read;
 
-#[derive(Deserialize)]
+// System prompt + tools + MCP tokens not surfaced to the hook JSON.
+// See github.com/anthropics/claude-code/issues/13783. PAI's documented baseline.
+const CONTEXT_BASELINE: i64 = 22_600;
+
+// ─────────────────────────────────────────────────────────────────────
+// Input schema (only fields we actually use)
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
 struct Input {
     model: Option<Model>,
     workspace: Option<Workspace>,
@@ -13,6 +21,7 @@ struct Input {
     agent: Option<Agent>,
     rate_limits: Option<RateLimits>,
     subagents: Option<Subagents>,
+    version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +37,7 @@ struct Model {
 #[derive(Deserialize)]
 struct Workspace {
     project_dir: Option<String>,
+    current_dir: Option<String>,
     git_worktree: Option<String>,
 }
 
@@ -37,11 +47,21 @@ struct ContextWindow {
     total_output_tokens: Option<i64>,
     context_window_size: Option<i64>,
     used_percentage: Option<f64>,
+    current_usage: Option<CurrentUsage>,
+}
+
+#[derive(Deserialize, Default)]
+struct CurrentUsage {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct Cost {
     total_cost_usd: Option<f64>,
+    total_duration_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -66,7 +86,152 @@ struct RateWindow {
     resets_at: Option<i64>,
 }
 
-/// Format a unix timestamp as "in Xh Ym @ Mon Apr 14 18:30 UTC"
+// ─────────────────────────────────────────────────────────────────────
+// Display mode
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Mode {
+    Compact,
+    Standard,
+}
+
+fn pick_mode(cols: usize) -> Mode {
+    if cols < 60 {
+        Mode::Compact
+    } else {
+        Mode::Standard
+    }
+}
+
+fn detect_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────────────
+// Everything fancy is opt-in. Default output is plain ASCII with color
+// on numeric values only (percentages, ages). Config file lives at
+// ~/.config/claude-statusline-rust/config.json; env vars override.
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+struct Config {
+    #[serde(default)]
+    bar: bool,
+    #[serde(default)]
+    glyphs: bool,
+    #[serde(default = "default_true")]
+    color: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bar: false,
+            glyphs: false,
+            color: true,
+        }
+    }
+}
+
+fn truthy(s: &str) -> bool {
+    matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+impl Config {
+    fn load() -> Self {
+        let mut cfg = Self::from_file().unwrap_or_default();
+        if let Ok(v) = std::env::var("CSR_BAR") {
+            cfg.bar = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("CSR_GLYPHS") {
+            cfg.glyphs = truthy(&v);
+        }
+        // Standard NO_COLOR convention disables color whenever set (even empty).
+        if std::env::var_os("NO_COLOR").is_some() {
+            cfg.color = false;
+        }
+        if let Ok(v) = std::env::var("CSR_COLOR") {
+            cfg.color = truthy(&v);
+        }
+        cfg
+    }
+
+    fn from_file() -> Option<Self> {
+        let home = std::env::var("HOME").ok()?;
+        let path = format!("{}/.config/claude-statusline-rust/config.json", home);
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Formatters (pure, testable)
+// ─────────────────────────────────────────────────────────────────────
+
+const RESET: &str = "\x1b[0m";
+const DIM: &str = "\x1b[38;2;100;116;139m";
+const EMPTY_BAR: &str = "\x1b[38;2;75;82;95m";
+
+fn fmt_duration_ms(ms: i64) -> String {
+    let sec = ms / 1000;
+    if sec >= 3600 {
+        format!("{}h{:02}m", sec / 3600, (sec % 3600) / 60)
+    } else if sec >= 60 {
+        format!("{}m{:02}s", sec / 60, sec % 60)
+    } else {
+        format!("{}s", sec)
+    }
+}
+
+fn fmt_bytes(b: u64) -> String {
+    if b == 0 {
+        "-".to_string()
+    } else if b < 1024 {
+        format!("{}B", b)
+    } else if b < 1024 * 1024 {
+        format!("{:.1}k", b as f64 / 1024.0)
+    } else {
+        format!("{:.1}M", b as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Returns (label, 24-bit ANSI color).
+fn fmt_age_secs(secs: i64) -> (String, &'static str) {
+    let secs = secs.max(0);
+    let mins = secs / 60;
+    let hrs = secs / 3600;
+    let days = secs / 86400;
+    let label = if mins < 1 {
+        "now".to_string()
+    } else if hrs < 1 {
+        format!("{}m", mins)
+    } else if days < 1 {
+        format!("{}h", hrs)
+    } else {
+        format!("{}d", days)
+    };
+    let color = if hrs < 1 {
+        "\x1b[38;2;125;211;252m"
+    } else if hrs < 24 {
+        "\x1b[38;2;96;165;250m"
+    } else if days < 7 {
+        "\x1b[38;2;59;130;246m"
+    } else {
+        "\x1b[38;2;99;102;241m"
+    };
+    (label, color)
+}
+
+/// Unix timestamp → "in Xh Ym @ Mon Apr 14 18:30 UTC"
 fn fmt_reset(resets_at: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -74,7 +239,6 @@ fn fmt_reset(resets_at: i64) -> String {
         .unwrap_or(0);
     let remaining = resets_at - now;
 
-    // Time remaining
     let countdown = if remaining <= 0 {
         "now".to_string()
     } else {
@@ -90,17 +254,13 @@ fn fmt_reset(resets_at: i64) -> String {
         }
     };
 
-    // Absolute UTC time from epoch
-    // Manual UTC date formatting (no chrono dependency needed)
     let ts = resets_at;
     let secs_per_day: i64 = 86400;
-    let days_since_epoch = ts / secs_per_day;
-    let time_of_day = ts % secs_per_day;
+    let days_since_epoch = ts.div_euclid(secs_per_day);
+    let time_of_day = ts.rem_euclid(secs_per_day);
     let hh = time_of_day / 3600;
     let mm = (time_of_day % 3600) / 60;
 
-    // Calculate year/month/day from days since 1970-01-01
-    // Using a civil-from-days algorithm
     let z = days_since_epoch + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -112,12 +272,11 @@ fn fmt_reset(resets_at: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let _y = if m <= 2 { y + 1 } else { y };
 
-    let weekday = ((days_since_epoch % 7) + 4) % 7; // 0=Sun
+    let weekday = ((days_since_epoch % 7) + 4).rem_euclid(7);
     let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let month_names = [
         "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-
     let wday = day_names[weekday as usize];
     let mon = month_names[m as usize];
 
@@ -127,55 +286,363 @@ fn fmt_reset(resets_at: i64) -> String {
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Context bar (Tailwind green → yellow → orange → red gradient)
+// ─────────────────────────────────────────────────────────────────────
+
+// Breakpoints for the Tailwind-inspired gradient (green → yellow → orange → red).
+const GRADIENT_STOPS: [(i32, i32, i32); 4] = [
+    (74, 222, 128), // 0%   green
+    (250, 204, 21), // 33%  yellow
+    (251, 146, 60), // 66%  orange
+    (239, 68, 68),  // 100% red
+];
+
+fn bucket_color(pos: usize, max: usize) -> String {
+    let pct = (pos * 100 / max).min(100) as i32;
+    let segment = ((pct / 33).min(2)) as usize;
+    let t = pct - (segment as i32) * 33;
+    let denom = if segment == 2 { 34 } else { 33 };
+    let (r0, g0, b0) = GRADIENT_STOPS[segment];
+    let (r1, g1, b1) = GRADIENT_STOPS[segment + 1];
+    let r = r0 + (r1 - r0) * t / denom;
+    let g = g0 + (g1 - g0) * t / denom;
+    let b = b0 + (b1 - b0) * t / denom;
+    format!("\x1b[38;2;{};{};{}m", r, g, b)
+}
+
+fn context_bar(width: usize, pct: i32) -> String {
+    let pct = pct.clamp(0, 100) as usize;
+    let filled = (pct * width).div_ceil(100).min(width);
+    let mut s = String::with_capacity(width * 12);
+    for i in 1..=width {
+        if i <= filled {
+            s.push_str(&bucket_color(i, width));
+        } else {
+            s.push_str(EMPTY_BAR);
+        }
+        s.push('\u{26C1}'); // ⛁
+        s.push_str(RESET);
+    }
+    s
+}
+
+/// Plain-ASCII bar for NO_COLOR / glyph-free output: `[####....]`.
+fn context_bar_plain(width: usize, pct: i32) -> String {
+    let pct = pct.clamp(0, 100) as usize;
+    let filled = (pct * width).div_ceil(100).min(width);
+    let mut s = String::with_capacity(width + 2);
+    s.push('[');
+    for i in 1..=width {
+        s.push(if i <= filled { '#' } else { '.' });
+    }
+    s.push(']');
+    s
+}
+
+/// Baseline-corrected context percent (matches /context more closely than raw used_percentage).
+fn computed_ctx_pct(cu: Option<&CurrentUsage>, cap: i64) -> Option<f64> {
+    let cu = cu?;
+    if cap <= 0 {
+        return None;
+    }
+    let cache_read = cu.cache_read_input_tokens.unwrap_or(0);
+    let cache_creation = cu.cache_creation_input_tokens.unwrap_or(0);
+    let input = cu.input_tokens.unwrap_or(0);
+    let output = cu.output_tokens.unwrap_or(0);
+    let content = cache_read + cache_creation + input + output;
+    if content <= 0 {
+        return None;
+    }
+    let used = content + CONTEXT_BASELINE;
+    Some((used as f64) * 100.0 / (cap as f64))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Directory + memory
+// ─────────────────────────────────────────────────────────────────────
+
+fn home_dir() -> Option<String> {
+    std::env::var("HOME").ok()
+}
+
+/// Shorten a path by substituting $HOME with ~.
+fn tilde(path: &str) -> String {
+    if let Some(home) = home_dir()
+        && let Some(rest) = path.strip_prefix(&home)
+    {
+        return format!("~{}", rest);
+    }
+    path.to_string()
+}
+
+/// If `current` is under `project`, return the relative suffix (leading "/" stripped).
+/// Otherwise return the full current path (tilde-shortened).
+fn relative_current(project: &str, current: &str) -> Option<String> {
+    if current == project {
+        return None;
+    }
+    if let Some(rest) = current.strip_prefix(project) {
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        }
+    } else {
+        Some(tilde(current))
+    }
+}
+
+/// Claude Code memory slug: absolute path with '/' → '-'.
+/// Matches ~/.claude/projects/<slug>/memory/ layout.
+fn path_to_memory_slug(abs_path: &str) -> String {
+    abs_path.replace('/', "-")
+}
+
+/// Returns (MEMORY.md bytes, other-memory-files bytes).
+fn memory_bytes(project_dir: &str) -> (u64, u64) {
+    let home = match home_dir() {
+        Some(h) => h,
+        None => return (0, 0),
+    };
+    let slug = path_to_memory_slug(project_dir);
+    let dir = format!("{}/.claude/projects/{}/memory", home, slug);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0),
+    };
+    let mut index = 0u64;
+    let mut other = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.ends_with(".md") {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if name_str == "MEMORY.md" {
+            index += size;
+        } else {
+            other += size;
+        }
+    }
+    (index, other)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Git info via gix (pure Rust)
+// ─────────────────────────────────────────────────────────────────────
+
+struct GitInfo {
+    branch: String,
+    age_secs: Option<i64>,
+    ahead: u32,
+    behind: u32,
+    dirty: bool,
+}
+
+fn git_info(path: &str) -> Option<GitInfo> {
+    let repo = gix::discover(path).ok()?;
+
+    let head = repo.head().ok()?;
+    let branch = match head.referent_name() {
+        Some(n) => n.shorten().to_string(),
+        None => "detached".to_string(),
+    };
+
+    let head_commit = repo.head_commit().ok();
+    let age_secs = head_commit.as_ref().and_then(|c| {
+        let t = c.time().ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(now - t.seconds)
+    });
+
+    let (ahead, behind) = ahead_behind(&repo).unwrap_or((0, 0));
+    let dirty = is_dirty(&repo).unwrap_or(false);
+
+    Some(GitInfo {
+        branch,
+        age_secs,
+        ahead,
+        behind,
+        dirty,
+    })
+}
+
+fn ahead_behind(repo: &gix::Repository) -> Option<(u32, u32)> {
+    let head = repo.head().ok()?;
+    let head_ref = head.try_into_referent()?;
+    let head_oid = head_ref.id();
+    let upstream = head_ref
+        .remote_tracking_ref_name(gix::remote::Direction::Fetch)?
+        .ok()?;
+    let upstream_ref = repo.find_reference(upstream.as_ref()).ok()?;
+    let upstream_oid = upstream_ref.id();
+    let mut ahead = 0u32;
+    let mut behind = 0u32;
+    // left-right counts via rev_walk
+    let platform = repo
+        .rev_walk([head_oid.detach(), upstream_oid.detach()])
+        .sorting(gix::revision::walk::Sorting::BreadthFirst);
+    // Simpler: compute merge base, then count commits on each side.
+    let base = repo
+        .merge_base(head_oid.detach(), upstream_oid.detach())
+        .ok()?;
+    for info in repo.rev_walk([head_oid.detach()]).all().ok()? {
+        let info = info.ok()?;
+        if info.id == base {
+            break;
+        }
+        ahead += 1;
+    }
+    for info in repo.rev_walk([upstream_oid.detach()]).all().ok()? {
+        let info = info.ok()?;
+        if info.id == base {
+            break;
+        }
+        behind += 1;
+    }
+    let _ = platform;
+    Some((ahead, behind))
+}
+
+fn is_dirty(repo: &gix::Repository) -> Option<bool> {
+    // gix::status returns an iterator of changes; any item means dirty.
+    let platform = repo
+        .status(gix::progress::Discard)
+        .ok()?
+        .index_worktree_submodules(gix::status::Submodule::AsConfigured { check_dirty: false });
+    let mut iter = platform.into_iter(None).ok()?;
+    Some(iter.next().is_some())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Render
+// ─────────────────────────────────────────────────────────────────────
+
+fn pct_color(pct: f64) -> &'static str {
+    if pct <= 33.0 {
+        "\x1b[38;2;74;222;128m"
+    } else if pct <= 66.0 {
+        "\x1b[38;2;250;204;21m"
+    } else {
+        "\x1b[38;2;251;113;133m"
+    }
+}
+
+/// Returns the ANSI escape if color is on, else empty string. Use in format!
+/// like `"{}{}{}"` with color_esc, text, reset() so output goes plain when off.
+fn c<'a>(cfg: &Config, color_esc: &'a str) -> &'a str {
+    if cfg.color { color_esc } else { "" }
+}
+
+fn reset(cfg: &Config) -> &'static str {
+    if cfg.color { RESET } else { "" }
+}
+
 fn main() {
     let mut buf = String::with_capacity(4096);
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         return;
     }
 
-    let data: Input = match serde_json::from_str(&buf) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+    let data: Input = serde_json::from_str(&buf).unwrap_or_default();
+    let cfg = Config::load();
 
-    let mut out = String::with_capacity(128);
+    let mode = pick_mode(detect_width());
+    let bar_width = if mode == Mode::Compact { 8 } else { 16 };
 
-    // Project dir: prefer $PROJECT_ROOT, fall back to workspace.project_dir
-    let project_env = std::env::var("PROJECT_ROOT").ok();
-    // Git branch from workspace
-    let branch = data
+    let mut out = String::with_capacity(512);
+    let rst = reset(&cfg);
+
+    // ── Directories ──
+    let project_dir = data
         .workspace
         .as_ref()
-        .and_then(|w| w.git_worktree.as_deref());
-
-    // Full project path + branch
-    let full_path = project_env
-        .as_deref()
-        .or_else(|| {
-            data.workspace
-                .as_ref()
-                .and_then(|w| w.project_dir.as_deref())
-        })
+        .and_then(|w| w.project_dir.as_deref())
         .unwrap_or("");
-    if !full_path.is_empty() {
-        out.push_str(full_path);
-        if let Some(b) = branch {
-            out.push(':');
-            out.push_str(b);
+    let current_dir = data
+        .workspace
+        .as_ref()
+        .and_then(|w| w.current_dir.as_deref())
+        .unwrap_or("");
+    let rel_cur = if !project_dir.is_empty() && !current_dir.is_empty() {
+        relative_current(project_dir, current_dir)
+    } else {
+        None
+    };
+
+    // ── Line 1: project [cd:cur] | model | CC | dur | mem ──
+    if !project_dir.is_empty() {
+        out.push_str(&tilde(project_dir));
+        if let Some(suffix) = &rel_cur {
+            if cfg.glyphs {
+                let _ = write!(out, " {}\u{2192}{} {}", c(&cfg, DIM), rst, suffix);
+            } else {
+                let _ = write!(out, " {}|{} cd:{}", c(&cfg, DIM), rst, suffix);
+            }
         }
-        out.push_str(" | ");
     }
 
-    // Model (strip "Claude " prefix)
     if let Some(name) = data.model.as_ref().and_then(|m| m.display_name.as_deref()) {
         let short = name.strip_prefix("Claude ").unwrap_or(name);
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
         out.push_str(short);
-        out.push_str(" | ");
     }
 
-    // Context usage -- current window size + cumulative session totals.
-    // current_ctx_tok is derived from used_percentage so it tracks the live
-    // window (and drops after compaction), while in/out remain session lifetime.
+    if let Some(cc) = data.version.as_deref() {
+        let _ = write!(out, " {}|{} CC:{}", c(&cfg, DIM), rst, cc);
+    }
+
+    if let Some(ms) = data.cost.as_ref().and_then(|c| c.total_duration_ms) {
+        let label = if cfg.glyphs { "\u{23F1}" } else { "dur:" };
+        let _ = write!(
+            out,
+            " {}|{} {}{}",
+            c(&cfg, DIM),
+            rst,
+            label,
+            fmt_duration_ms(ms)
+        );
+    }
+
+    // Memory bytes (only if project_dir known)
+    if !project_dir.is_empty() {
+        let (idx, other) = memory_bytes(project_dir);
+        if idx > 0 || other > 0 {
+            let _ = write!(
+                out,
+                " {}|{} mem:{}+{}",
+                c(&cfg, DIM),
+                rst,
+                fmt_bytes(idx),
+                fmt_bytes(other)
+            );
+        }
+    }
+
+    // ── Line 2: ctx (bar if opted in), session tokens, cost ──
+    let cap = data
+        .context_window
+        .as_ref()
+        .and_then(|c| c.context_window_size)
+        .unwrap_or(0);
+    let raw_pct = data
+        .context_window
+        .as_ref()
+        .and_then(|c| c.used_percentage)
+        .unwrap_or(0.0);
+    let cu_ref = data
+        .context_window
+        .as_ref()
+        .and_then(|c| c.current_usage.as_ref());
+    let computed_pct = computed_ctx_pct(cu_ref, cap).unwrap_or(raw_pct);
     let in_tok = data
         .context_window
         .as_ref()
@@ -186,39 +653,93 @@ fn main() {
         .as_ref()
         .and_then(|c| c.total_output_tokens)
         .unwrap_or(0);
-    let cap = data
-        .context_window
-        .as_ref()
-        .and_then(|c| c.context_window_size)
-        .unwrap_or(0);
-    let pct = data
-        .context_window
-        .as_ref()
-        .and_then(|c| c.used_percentage)
-        .unwrap_or(0.0);
-    let current_ctx_tok = if cap > 0 && pct > 0.0 {
-        ((pct / 100.0) * cap as f64) as i64
-    } else {
-        in_tok + out_tok
-    };
+
     if cap > 0 {
+        let current_tok = ((computed_pct / 100.0) * cap as f64) as i64;
+        let pct_int = computed_pct.round() as i32;
+        out.push('\n');
+        out.push_str("ctx ");
+        if cfg.bar {
+            // Bar respects cfg.color through its ANSI codes; if color off, emit
+            // plain ASCII hashes/dots instead.
+            if cfg.color {
+                out.push_str(&context_bar(bar_width, pct_int));
+            } else {
+                out.push_str(&context_bar_plain(bar_width, pct_int));
+            }
+            out.push(' ');
+        }
         let _ = write!(
             out,
-            "ctx:{}/{} ({:.0}%) | session in:{} out:{}",
-            current_ctx_tok, cap, pct, in_tok, out_tok
+            "{}{}%{} ({}k/{}k)",
+            c(&cfg, pct_color(computed_pct)),
+            pct_int,
+            rst,
+            current_tok / 1000,
+            cap / 1000
         );
-    } else {
-        let _ = write!(out, "in:{} out:{}", in_tok, out_tok);
+        if mode == Mode::Standard {
+            let _ = write!(
+                out,
+                " {}|{} session in:{} out:{}",
+                c(&cfg, DIM),
+                rst,
+                in_tok,
+                out_tok
+            );
+        }
     }
 
-    // Cost (session lifetime)
     if let Some(usd) = data.cost.as_ref().and_then(|c| c.total_cost_usd)
         && usd > 0.001
     {
-        let _ = write!(out, " | ${:.2}", usd);
+        let _ = write!(out, " {}|{} ${:.2}", c(&cfg, DIM), rst, usd);
     }
 
-    // Line 2: 5h rate limit
+    // ── Git line ──
+    let gi = if !current_dir.is_empty() {
+        git_info(current_dir)
+    } else if !project_dir.is_empty() {
+        git_info(project_dir)
+    } else {
+        None
+    };
+    if let Some(g) = &gi {
+        out.push('\n');
+        let _ = write!(out, "git: {}", g.branch);
+        if let Some(secs) = g.age_secs {
+            let (label, color) = fmt_age_secs(secs);
+            let _ = write!(out, " {}({}){}", c(&cfg, color), label, rst);
+        }
+        if g.dirty {
+            let _ = write!(out, " {}*{}", c(&cfg, "\x1b[38;2;251;191;36m"), rst);
+        }
+        if g.ahead > 0 {
+            let (sym, color) = if cfg.glyphs {
+                ("\u{2191}", "\x1b[38;2;74;222;128m")
+            } else {
+                ("ahead:", "\x1b[38;2;74;222;128m")
+            };
+            let _ = write!(out, " {}{}{}{}", c(&cfg, color), sym, g.ahead, rst);
+        }
+        if g.behind > 0 {
+            let (sym, color) = if cfg.glyphs {
+                ("\u{2193}", "\x1b[38;2;251;113;133m")
+            } else {
+                ("behind:", "\x1b[38;2;251;113;133m")
+            };
+            let _ = write!(out, " {}{}{}{}", c(&cfg, color), sym, g.behind, rst);
+        }
+    } else if let Some(br) = data
+        .workspace
+        .as_ref()
+        .and_then(|w| w.git_worktree.as_deref())
+    {
+        // Fallback if gix couldn't open (e.g., not a git repo from the hook's view)
+        let _ = write!(out, "\ngit: {}", br);
+    }
+
+    // ── Rate limit lines ──
     if let Some(five) = data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()) {
         let pct = five.used_percentage.unwrap_or(0.0);
         let icon = if pct > 80.0 {
@@ -235,7 +756,6 @@ fn main() {
         let _ = write!(out, "\n5h window: {:.0}% used{}{}", pct, icon, reset);
     }
 
-    // Line 3: 7d rate limit
     if let Some(seven) = data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()) {
         let pct = seven.used_percentage.unwrap_or(0.0);
         if pct > 0.0 {
@@ -247,37 +767,37 @@ fn main() {
         }
     }
 
-    // Line 4: misc (agents, vim, agent name)
-    let mut misc_parts: Vec<String> = Vec::new();
-
+    // ── Misc line ──
+    let mut misc: Vec<String> = Vec::new();
     let sub_count = data.subagents.as_ref().and_then(|s| s.count).unwrap_or(0);
     if sub_count > 0 {
-        misc_parts.push(format!("agents:{}", sub_count));
+        misc.push(format!("agents:{}", sub_count));
     }
-
     if let Some(mode) = data.vim.as_ref().and_then(|v| v.mode.as_deref()) {
-        misc_parts.push(format!("[{}]", mode));
+        misc.push(format!("[{}]", mode));
     }
-
     if let Some(name) = data.agent.as_ref().and_then(|a| a.name.as_deref()) {
-        misc_parts.push(format!("{{{}}}", name));
+        misc.push(format!("{{{}}}", name));
     }
-
-    if !misc_parts.is_empty() {
-        let _ = write!(out, "\n{}", misc_parts.join(" | "));
+    if !misc.is_empty() {
+        let _ = write!(out, "\n{}", misc.join(" | "));
     }
 
     print!("{out}");
 
     // Log metrics to SQLite (best-effort, never block display)
+    let branch = data
+        .workspace
+        .as_ref()
+        .and_then(|w| w.git_worktree.as_deref());
     let _ = log_metrics(
-        full_path,
+        project_dir,
         branch,
         data.model.as_ref().and_then(|m| m.display_name.as_deref()),
         in_tok,
         out_tok,
         cap,
-        pct,
+        raw_pct,
         data.cost.as_ref().and_then(|c| c.total_cost_usd),
         data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
         data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
@@ -300,7 +820,6 @@ fn log_metrics(
     let home = std::env::var("HOME")?;
     let db_path = format!("{}/.config/dbg/statusline-metrics.db", home);
 
-    // Ensure parent dir exists
     let _ = std::fs::create_dir_all(format!("{}/.config/dbg", home));
 
     let conn = Connection::open(&db_path)?;
@@ -325,7 +844,6 @@ fn log_metrics(
         );",
     )?;
 
-    // Deduplicate: skip if the last row has identical token counts and rate %
     let last: Option<(i64, i64, f64, f64)> = conn
         .query_row(
             "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1) FROM metrics ORDER BY id DESC LIMIT 1",
@@ -343,7 +861,7 @@ fn log_metrics(
         && (last_5h - cur_5h).abs() < 0.01
         && (last_7d - cur_7d).abs() < 0.01
     {
-        return Ok(()); // Nothing changed, skip
+        return Ok(());
     }
 
     conn.execute(
@@ -366,4 +884,144 @@ fn log_metrics(
     )?;
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_thresholds() {
+        assert_eq!(pick_mode(0), Mode::Compact);
+        assert_eq!(pick_mode(59), Mode::Compact);
+        assert_eq!(pick_mode(60), Mode::Standard);
+        assert_eq!(pick_mode(200), Mode::Standard);
+    }
+
+    #[test]
+    fn duration_formatting() {
+        assert_eq!(fmt_duration_ms(0), "0s");
+        assert_eq!(fmt_duration_ms(5_000), "5s");
+        assert_eq!(fmt_duration_ms(65_000), "1m05s");
+        assert_eq!(fmt_duration_ms(3_725_000), "1h02m");
+        assert_eq!(fmt_duration_ms(7_320_000), "2h02m");
+    }
+
+    #[test]
+    fn bytes_formatting() {
+        assert_eq!(fmt_bytes(0), "-");
+        assert_eq!(fmt_bytes(512), "512B");
+        assert_eq!(fmt_bytes(1536), "1.5k");
+        assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0M");
+    }
+
+    #[test]
+    fn age_formatting() {
+        let (l, _) = fmt_age_secs(0);
+        assert_eq!(l, "now");
+        let (l, _) = fmt_age_secs(30);
+        assert_eq!(l, "now");
+        let (l, _) = fmt_age_secs(300);
+        assert_eq!(l, "5m");
+        let (l, _) = fmt_age_secs(7200);
+        assert_eq!(l, "2h");
+        let (l, _) = fmt_age_secs(90000);
+        assert_eq!(l, "1d");
+    }
+
+    #[test]
+    fn memory_slug() {
+        assert_eq!(
+            path_to_memory_slug("/Users/foo/code/bar"),
+            "-Users-foo-code-bar"
+        );
+        assert_eq!(path_to_memory_slug("/"), "-");
+    }
+
+    #[test]
+    fn relative_current_semantics() {
+        assert_eq!(
+            relative_current("/a/b", "/a/b").as_deref(),
+            None,
+            "same path → no suffix"
+        );
+        assert_eq!(relative_current("/a/b", "/a/b/c/d").as_deref(), Some("c/d"));
+        assert_eq!(
+            relative_current("/a/b", "/x/y").as_deref(),
+            Some("/x/y"),
+            "unrelated → absolute"
+        );
+    }
+
+    #[test]
+    fn computed_ctx_with_baseline() {
+        let cu = CurrentUsage {
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            cache_read_input_tokens: Some(10_000),
+            cache_creation_input_tokens: Some(5_000),
+        };
+        let pct = computed_ctx_pct(Some(&cu), 200_000).unwrap();
+        // (10000+5000+1000+500) + 22600 = 39100 / 200000 = 19.55%
+        assert!((pct - 19.55).abs() < 0.01, "got {}", pct);
+    }
+
+    #[test]
+    fn computed_ctx_none_without_data() {
+        assert!(computed_ctx_pct(None, 200_000).is_none());
+        let empty = CurrentUsage::default();
+        assert!(computed_ctx_pct(Some(&empty), 200_000).is_none());
+        assert!(computed_ctx_pct(Some(&empty), 0).is_none());
+    }
+
+    #[test]
+    fn context_bar_bounds() {
+        let b = context_bar(8, -10);
+        assert!(b.contains('\u{26C1}'));
+        let b = context_bar(8, 999);
+        assert!(b.contains('\u{26C1}'));
+        // 0% → no filled buckets (only empty color)
+        let b = context_bar(4, 0);
+        let filled_count = b.matches("\x1b[38;2;74").count();
+        assert_eq!(filled_count, 0);
+        // 100% → all filled
+        let b = context_bar(4, 100);
+        assert_eq!(b.matches(EMPTY_BAR).count(), 0);
+    }
+
+    #[test]
+    fn context_bar_plain_shapes() {
+        assert_eq!(context_bar_plain(4, 0), "[....]");
+        assert_eq!(context_bar_plain(4, 100), "[####]");
+        // 50% of 4 = 2 filled
+        assert_eq!(context_bar_plain(4, 50), "[##..]");
+        // Out-of-range clamp
+        assert_eq!(context_bar_plain(4, 999), "[####]");
+        assert_eq!(context_bar_plain(4, -50), "[....]");
+    }
+
+    #[test]
+    fn config_defaults_are_opt_in() {
+        let cfg = Config::default();
+        assert!(!cfg.bar, "bar should be opt-in");
+        assert!(!cfg.glyphs, "glyphs should be opt-in");
+        assert!(cfg.color, "color should be on by default");
+    }
+
+    #[test]
+    fn truthy_parsing() {
+        assert!(truthy("1"));
+        assert!(truthy("true"));
+        assert!(truthy("TRUE"));
+        assert!(truthy("yes"));
+        assert!(truthy("on"));
+        assert!(!truthy("0"));
+        assert!(!truthy("false"));
+        assert!(!truthy("no"));
+        assert!(!truthy(""));
+    }
 }
