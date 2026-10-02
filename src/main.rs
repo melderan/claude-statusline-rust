@@ -1486,9 +1486,10 @@ fn residue_deltas(conn: &Connection, session_id: &str, n: usize) -> DbResult<Vec
 // is never blocked and nothing is forced.
 //
 // Recorder schema (house ADR 0015, proposed): measures(id, ts, room, source,
-// source_id, session_id, prompt_id, kind, key, value, unit, data) with
-// UNIQUE(room, source, source_id), written with INSERT OR IGNORE so a flush
-// killed between the insert and the mark cannot write a row twice.
+// buffer, source_id, session_id, prompt_id, kind, key, value, unit, data) with
+// UNIQUE(room, source, buffer, source_id), written with INSERT OR IGNORE so a
+// flush killed between the insert and the mark cannot write a row twice, and
+// a rebuilt room (local ids back at 1, a new buffer id) collides with nothing.
 
 const RECORDER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const FLUSH_BATCH: i64 = 2000;
@@ -1533,8 +1534,10 @@ const MEASURES_COLUMNS: &str =
     "ts, room, source, buffer, source_id, session_id, prompt_id, kind, key, value, unit, data";
 
 /// Open the recorder the house way: dotfile lock, rollback journal, a few
-/// seconds of patience, no lock removal. Creates the table and indexes, and
-/// migrates a table from before the `buffer` column (rows get buffer 'v0').
+/// seconds of patience, no lock removal. Creates the table and indexes. A
+/// table from before the `buffer` column is refused, not migrated: no such
+/// recorder exists in the house, and a migration racing a second flusher
+/// would relabel rows.
 fn open_recorder(path: &str) -> DbResult<Connection> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1564,62 +1567,54 @@ fn open_recorder(path: &str) -> DbResult<Connection> {
 CREATE INDEX IF NOT EXISTS measures_room_ts        ON measures(room, ts);
 CREATE INDEX IF NOT EXISTS measures_kind_key_ts    ON measures(kind, key, ts);
 CREATE INDEX IF NOT EXISTS measures_session_prompt ON measures(session_id, prompt_id);";
-    let has_table: bool = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='measures'",
-        [],
-        |r| r.get::<_, i64>(0),
-    )? > 0;
-    if has_table {
-        let mut cols: Vec<String> = Vec::new();
-        {
-            let mut stmt = conn.prepare("PRAGMA table_info(measures)")?;
-            for c in stmt.query_map([], |r| r.get::<_, String>(1))? {
-                cols.push(c?);
-            }
-        }
-        if !cols.iter().any(|c| c == "buffer") {
-            let old_cols = MEASURES_COLUMNS.replace("buffer, ", "");
-            conn.execute_batch(&format!(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE measures RENAME TO measures_v0;
-                 {create}
-                 INSERT OR IGNORE INTO measures ({MEASURES_COLUMNS})
-                   SELECT {} FROM measures_v0;
-                 DROP TABLE measures_v0;
-                 COMMIT;",
-                old_cols.replace("source, ", "source, 'v0', ")
-            ))?;
-            return Ok(conn);
-        }
-    }
     conn.execute_batch(create)?;
+    let has_buffer: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('measures') WHERE name = 'buffer'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_buffer == 0 {
+        return Err("measures table predates the buffer column; move the file aside".into());
+    }
     Ok(conn)
 }
 
 /// The local file's identity: a random id minted the first time the file is
 /// used for a flush and kept in it. A rebuilt room starts its local ids at 1
 /// again, so (room, source, source_id) alone would collide with the old
-/// life's rows; the buffer id tells the lives apart.
+/// life's rows; the buffer id tells the lives apart. A singleton row written
+/// with INSERT OR IGNORE inside BEGIN IMMEDIATE, so two first flushes at once
+/// (a doubled Stop hook) end with one id, not two copies of every row.
 fn buffer_id(local: &Connection) -> DbResult<String> {
     local.execute_batch(
         "CREATE TABLE IF NOT EXISTS buffer_identity (
-            id      TEXT PRIMARY KEY,
+            k       INTEGER PRIMARY KEY CHECK (k = 1),
+            id      TEXT NOT NULL,
             created TEXT NOT NULL
          );",
     )?;
-    match local.query_row("SELECT id FROM buffer_identity LIMIT 1", [], |r| {
-        r.get::<_, String>(0)
-    }) {
-        Ok(id) => Ok(id),
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            let id = mint_id();
-            local.execute(
-                "INSERT INTO buffer_identity (id, created) VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                [&id],
-            )?;
+    let candidate = mint_id();
+    local.execute_batch("BEGIN IMMEDIATE;")?;
+    let inner = || -> DbResult<String> {
+        local.execute(
+            "INSERT OR IGNORE INTO buffer_identity (k, id, created) VALUES (1, ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            [&candidate],
+        )?;
+        Ok(
+            local.query_row("SELECT id FROM buffer_identity WHERE k = 1", [], |r| {
+                r.get(0)
+            })?,
+        )
+    };
+    match inner() {
+        Ok(id) => {
+            local.execute_batch("COMMIT;")?;
             Ok(id)
         }
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            let _ = local.execute_batch("ROLLBACK;");
+            Err(e)
+        }
     }
 }
 
@@ -1776,8 +1771,8 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
         .unwrap_or_else(|_| recorder_path.to_string());
     let mut inserted = 0usize;
     for _ in 0..FLUSH_MAX_BATCHES {
-        let last = last_flushed_id(&local, &target)?;
-        let rows = read_local_rows(&local, last)?;
+        let last = ctx(last_flushed_id(&local, &target), "local metrics file")?;
+        let rows = ctx(read_local_rows(&local, last), "local metrics file")?;
         if rows.is_empty() {
             break;
         }
@@ -1794,43 +1789,55 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
             &format!("recorder {recorder_path}"),
         )?;
         {
-            let mut ins = tx.prepare(&format!(
-                "INSERT OR IGNORE INTO measures ({MEASURES_COLUMNS})
+            let mut ins = ctx(
+                tx.prepare(&format!(
+                    "INSERT OR IGNORE INTO measures ({MEASURES_COLUMNS})
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-            ))?;
+                ))
+                .map_err(Into::into),
+                &format!("recorder {recorder_path}"),
+            )?;
             for r in &rows {
                 let ts = recorder_ts(&r.ts);
-                inserted += ins.execute(rusqlite::params![
-                    ts,
-                    room,
-                    "statusline",
-                    buffer,
-                    r.id,
-                    r.session_id,
-                    r.prompt_id,
-                    "statusline",
-                    "call",
-                    r.content.map(|c| c as f64),
-                    "tokens",
-                    r.data.to_string(),
-                ])?;
-                if let Some(on) = r.always_on_chars
-                    && prev_on != Some(on)
-                {
-                    inserted += ins.execute(rusqlite::params![
+                inserted += ctx(
+                    ins.execute(rusqlite::params![
                         ts,
                         room,
-                        "statusline.always_on",
+                        "statusline",
                         buffer,
                         r.id,
                         r.session_id,
                         r.prompt_id,
-                        "always_on",
-                        "chars",
-                        on as f64,
-                        "chars",
-                        r.files.to_string(),
-                    ])?;
+                        "statusline",
+                        "call",
+                        r.content.map(|c| c as f64),
+                        "tokens",
+                        r.data.to_string(),
+                    ])
+                    .map_err(Into::into),
+                    &format!("recorder {recorder_path}"),
+                )?;
+                if let Some(on) = r.always_on_chars
+                    && prev_on != Some(on)
+                {
+                    inserted += ctx(
+                        ins.execute(rusqlite::params![
+                            ts,
+                            room,
+                            "statusline.always_on",
+                            buffer,
+                            r.id,
+                            r.session_id,
+                            r.prompt_id,
+                            "always_on",
+                            "chars",
+                            on as f64,
+                            "chars",
+                            r.files.to_string(),
+                        ])
+                        .map_err(Into::into),
+                        &format!("recorder {recorder_path}"),
+                    )?;
                     prev_on = Some(on);
                 }
             }
@@ -1840,7 +1847,10 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
             &format!("recorder {recorder_path}"),
         )?;
         let new_last = rows.last().map(|r| r.id).unwrap_or(last);
-        advance_mark(&local, &target, new_last)?;
+        ctx(
+            advance_mark(&local, &target, new_last),
+            "local metrics file",
+        )?;
         if (rows.len() as i64) < FLUSH_BATCH {
             break;
         }
@@ -2905,8 +2915,8 @@ mod tests {
     }
 
     #[test]
-    fn recorder_migrates_a_table_without_buffer() {
-        let dir = fresh_dir("migrate");
+    fn recorder_refuses_a_table_without_buffer() {
+        let dir = fresh_dir("oldrec");
         let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
         {
             let conn = Connection::open_with_flags_and_vfs(
@@ -2919,21 +2929,70 @@ mod tests {
                 "CREATE TABLE measures (id INTEGER PRIMARY KEY, ts TEXT NOT NULL, room TEXT NOT NULL,
                    source TEXT NOT NULL, source_id INTEGER NOT NULL, session_id TEXT, prompt_id TEXT,
                    kind TEXT NOT NULL, key TEXT NOT NULL, value REAL, unit TEXT, data TEXT,
-                   UNIQUE(room, source, source_id));
-                 INSERT INTO measures (ts, room, source, source_id, kind, key, value) VALUES
-                   ('2026-10-02T00:00:00.000Z', 'r', 'statusline', 1, 'statusline', 'call', 1.0);",
+                   UNIQUE(room, source, source_id));",
             )
             .unwrap();
         }
-        let rec = open_recorder(&rp).unwrap();
-        let (n, buffer): (i64, String) = rec
-            .query_row("SELECT COUNT(*), MIN(buffer) FROM measures", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+        let err = open_recorder(&rp).unwrap_err().to_string();
+        assert!(err.contains("buffer"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buffer_id_is_minted_once_under_concurrent_first_flushes() {
+        let dir = fresh_dir("mint");
+        let path = dir.join("local.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    let c = Connection::open(&p).unwrap();
+                    c.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    b.wait();
+                    buffer_id(&c).unwrap()
+                })
             })
+            .collect();
+        let ids: std::collections::HashSet<String> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(ids.len(), 1, "eight first flushes, one identity: {ids:?}");
+        let c = Connection::open(&path).unwrap();
+        let rows: i64 = c
+            .query_row("SELECT COUNT(*) FROM buffer_identity", [], |r| r.get(0))
             .unwrap();
-        assert_eq!((n, buffer.as_str()), (1, "v0"));
-        drop(rec);
-        let _ = open_recorder(&rp).unwrap(); // idempotent
+        assert_eq!(rows, 1);
+        assert!(ids.contains(&buffer_id(&c).unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_walks_every_batch_of_a_long_backlog() {
+        let dir = fresh_dir("backlog");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_string_lossy().to_string();
+        let cfg = Config::default();
+        let n = FLUSH_BATCH + 1;
+        {
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            local.execute_batch("BEGIN").unwrap();
+            for i in 0..n {
+                log_row(&local, "p", 1_000 + i, i, &on(100));
+            }
+            local.execute_batch("COMMIT").unwrap();
+        }
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        assert_eq!(
+            run_flush(&cfg, &h, &rp, "roomA").unwrap() as i64,
+            n + 1,
+            "every local row plus one always_on row, across two batches"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
