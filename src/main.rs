@@ -1321,14 +1321,29 @@ fn open_metrics_at(
     } else {
         Connection::open(path)?
     };
-    // A render waits RENDER_PATIENCE (a shared file gets three times that);
-    // the flush passes its own, longer patience.
-    conn.busy_timeout(if shared { patience * 3 } else { patience })?;
-    if shared {
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
-    } else {
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    // The same patience on either kind of file: a render waits
+    // RENDER_PATIENCE, the flush passes its own, longer one.
+    conn.busy_timeout(patience)?;
+    // Switching a brand-new file to WAL needs an exclusive lock, and SQLite
+    // answers BUSY at once without consulting the busy handler, so several
+    // first openers of a room's life would all skip. Retry within patience.
+    let mode = if shared { "DELETE" } else { "WAL" };
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        match conn.query_row(&format!("PRAGMA journal_mode={mode}"), [], |r| {
+            r.get::<_, String>(0)
+        }) {
+            Ok(_) => break,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     ensure_schema(&conn)?;
     Ok(conn)
 }
@@ -1559,6 +1574,8 @@ fn flush_main() {
         );
         return;
     };
+    // Every refusal below exits 0: the flush is a Stop hook's errand and a
+    // failed errand must never fail the session. The message is the signal.
     match run_flush(&cfg, &home, &recorder, &room) {
         Ok(r) => {
             println!(
@@ -1616,7 +1633,12 @@ fn open_recorder(path: &str) -> DbResult<Connection> {
             |r| r.get(0),
         )
         .map_err(|e| -> Box<dyn std::error::Error> {
-            format!("{e} (a recorder left in WAL mode cannot be read through the dotfile VFS; run PRAGMA journal_mode=DELETE on it)").into()
+            let cant_open = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen);
+            if cant_open || std::path::Path::new(&format!("{path}-wal")).exists() {
+                format!("{e} (a recorder left in WAL mode cannot be read through the dotfile VFS; run PRAGMA journal_mode=DELETE on it)").into()
+            } else {
+                e.into()
+            }
         })?;
     if has_table > 0 {
         check_recorder_key(&conn)?;
@@ -1723,6 +1745,16 @@ fn check_recorder_key(conn: &Connection) -> DbResult<()> {
         let covers_key = RECORDER_KEY.iter().all(|k| names.contains(&Some(*k)));
         if !has_id && !covers_key {
             return refuse(&format!("unique index {name} is narrower than the key"));
+        }
+        // A covering index folds rows the key would keep apart if a key
+        // column in it compares loosely (room COLLATE NOCASE).
+        if covers_key
+            && let Some((_, Some(col), coll)) = cols.iter().find(|(_, c, coll)| {
+                c.as_deref().is_some_and(|c| RECORDER_KEY.contains(&c))
+                    && !coll.eq_ignore_ascii_case("BINARY")
+            })
+        {
+            return refuse(&format!("index {name} uses collation {coll} on {col}"));
         }
     }
     if key_found {
@@ -1865,35 +1897,72 @@ fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec<LocalRow>>
                 always_on_chars, always_on_files
          FROM metrics WHERE id > ?1 ORDER BY id LIMIT ?2",
     )?;
+    const NAMES: [&str; 19] = [
+        "id",
+        "ts",
+        "project",
+        "branch",
+        "model",
+        "session_id",
+        "prompt_id",
+        "content",
+        "in_tokens",
+        "out_tokens",
+        "context_cap",
+        "context_pct",
+        "cost_usd",
+        "rate_5h_pct",
+        "rate_5h_resets",
+        "rate_7d_pct",
+        "rate_7d_resets",
+        "always_on_chars",
+        "always_on_files",
+    ];
     let rows = stmt.query_map(rusqlite::params![after_id, FLUSH_BATCH], |r| {
-        let files_text: Option<String> = r.get(18)?;
+        let id: i64 = r.get(0)?;
+        // A hand-edited value of the wrong type names its row, so the flush
+        // that it stops can be fixed rather than puzzled over.
+        fn col<T: rusqlite::types::FromSql>(
+            r: &rusqlite::Row<'_>,
+            idx: usize,
+            id: i64,
+        ) -> rusqlite::Result<T> {
+            r.get::<_, T>(idx).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    idx,
+                    rusqlite::types::Type::Null,
+                    format!("row {id}: {}: {e}", NAMES[idx]).into(),
+                )
+            })
+        }
+        let files_text: Option<String> = col(r, 18, id)?;
         let files = files_text
             .as_deref()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
             .unwrap_or(serde_json::Value::Null);
         let data = serde_json::json!({
-            "project": r.get::<_, Option<String>>(2)?,
-            "branch": r.get::<_, Option<String>>(3)?,
-            "model": r.get::<_, Option<String>>(4)?,
-            "content": r.get::<_, Option<i64>>(7)?,
-            "in_tokens": r.get::<_, Option<i64>>(8)?,
-            "out_tokens": r.get::<_, Option<i64>>(9)?,
-            "context_cap": r.get::<_, Option<i64>>(10)?,
-            "context_pct": r.get::<_, Option<f64>>(11)?,
-            "cost_usd": r.get::<_, Option<f64>>(12)?,
-            "rate_5h_pct": r.get::<_, Option<f64>>(13)?,
-            "rate_5h_resets": r.get::<_, Option<i64>>(14)?,
-            "rate_7d_pct": r.get::<_, Option<f64>>(15)?,
-            "rate_7d_resets": r.get::<_, Option<i64>>(16)?,
-            "always_on_chars": r.get::<_, Option<i64>>(17)?,
+            "project": col::<Option<String>>(r, 2, id)?,
+            "branch": col::<Option<String>>(r, 3, id)?,
+            "model": col::<Option<String>>(r, 4, id)?,
+            "content": col::<Option<i64>>(r, 7, id)?,
+            "in_tokens": col::<Option<i64>>(r, 8, id)?,
+            "out_tokens": col::<Option<i64>>(r, 9, id)?,
+            "context_cap": col::<Option<i64>>(r, 10, id)?,
+            "context_pct": col::<Option<f64>>(r, 11, id)?,
+            "cost_usd": col::<Option<f64>>(r, 12, id)?,
+            "rate_5h_pct": col::<Option<f64>>(r, 13, id)?,
+            "rate_5h_resets": col::<Option<i64>>(r, 14, id)?,
+            "rate_7d_pct": col::<Option<f64>>(r, 15, id)?,
+            "rate_7d_resets": col::<Option<i64>>(r, 16, id)?,
+            "always_on_chars": col::<Option<i64>>(r, 17, id)?,
         });
         Ok(LocalRow {
-            id: r.get(0)?,
-            ts: r.get(1)?,
-            session_id: r.get(5)?,
-            prompt_id: r.get(6)?,
-            content: r.get(7)?,
-            always_on_chars: r.get(17)?,
+            id,
+            ts: col(r, 1, id)?,
+            session_id: col(r, 5, id)?,
+            prompt_id: col(r, 6, id)?,
+            content: col(r, 7, id)?,
+            always_on_chars: col(r, 17, id)?,
             data,
             files,
         })
@@ -3337,6 +3406,84 @@ mod tests {
         assert!(e.contains("UNIQUE(room, source, buffer, source_id)"), "{e}");
         let e = recorder_shape("k-none", &format!("CREATE TABLE measures ({COLS});")).unwrap_err();
         assert!(e.contains("no such index"), "{e}");
+        // DESC on a key column is still the key; a covering index with a loose collation is not.
+        recorder_shape(
+            "k-desc",
+            &format!("CREATE TABLE measures ({COLS}); CREATE UNIQUE INDEX k ON measures(room, source, buffer DESC, source_id);"),
+        )
+        .unwrap();
+        let e = recorder_shape(
+            "k-superset-nocase",
+            &format!("CREATE TABLE measures ({COLS}, UNIQUE(room, source, buffer, source_id)); CREATE UNIQUE INDEX k2 ON measures(room COLLATE NOCASE, source, buffer, source_id, kind);"),
+        )
+        .unwrap_err();
+        assert!(e.contains("collation") && e.contains("room"), "{e}");
+    }
+
+    #[test]
+    fn first_openers_of_a_new_file_all_succeed() {
+        // PRAGMA journal_mode=WAL on a brand-new file answers BUSY without the
+        // busy handler; without the retry, concurrent first opens skip.
+        for round in 0..5 {
+            let dir = fresh_dir(&format!("firstopen{round}"));
+            let path = dir.join("metrics.db").to_string_lossy().to_string();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let p = path.clone();
+                    let b = barrier.clone();
+                    std::thread::spawn(move || {
+                        b.wait();
+                        open_metrics_at(&p, false, std::time::Duration::from_secs(3))
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            let failures: Vec<String> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap().err())
+                .collect();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(failures.is_empty(), "round {round}: {failures:?}");
+        }
+    }
+
+    #[test]
+    fn complete_schema_needs_no_write_lock() {
+        let dir = fresh_dir("nolock");
+        let path = dir.join("metrics.db").to_string_lossy().to_string();
+        drop(open_metrics_at(&path, false, RENDER_PATIENCE).unwrap());
+        // Someone holds the write lock; a render must still open a complete file.
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let t0 = std::time::Instant::now();
+        let opened = open_metrics_at(&path, false, RENDER_PATIENCE);
+        assert!(opened.is_ok(), "{:?}", opened.err().map(|e| e.to_string()));
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500));
+        holder.execute_batch("COMMIT;").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_names_the_row_of_a_bad_local_value() {
+        let dir = fresh_dir("badrow");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_string_lossy().to_string();
+        let cfg = Config::default();
+        {
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            log_row(&local, "p1", 84_000, 1, &on(100));
+            log_row(&local, "p2", 88_000, 2, &on(100));
+            local
+                .execute("UPDATE metrics SET in_tokens = 'x' WHERE id = 2", [])
+                .unwrap();
+        }
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        let err = run_flush(&cfg, &h, &rp, "roomA").unwrap_err().to_string();
+        assert!(err.contains("row 2") && err.contains("in_tokens"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
