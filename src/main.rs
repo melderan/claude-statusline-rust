@@ -130,14 +130,21 @@ struct Config {
     #[serde(default = "default_true")]
     color: bool,
     /// Residue line: how many recent user turns to show with their context
-    /// cost (`res: +84k +3.1k ...`). 0 (the default) hides the line; values
-    /// above RESIDUE_MAX are clamped.
+    /// cost (`res: +84k +3.1k ...`). 0 (the default) hides the line. Any
+    /// integer is accepted and clamped in code to 0..=RESIDUE_MAX, so a bad
+    /// value here never fails the whole config and drops the other settings.
+    /// The numbers sum to less than the ctx figure by the fixed baseline that
+    /// ctx adds for the system prompt and tools.
     #[serde(default)]
-    residue: u8,
+    residue: i64,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
-const RESIDUE_MAX: u8 = 10;
+const RESIDUE_MAX: i64 = 10;
+
+fn clamp_residue(n: i64) -> usize {
+    n.clamp(0, RESIDUE_MAX) as usize
+}
 
 fn default_true() -> bool {
     true
@@ -175,11 +182,11 @@ impl Config {
             cfg.color = truthy(&v);
         }
         if let Ok(v) = std::env::var("CSR_RESIDUE")
-            && let Ok(n) = v.trim().parse::<u8>()
+            && let Ok(n) = v.trim().parse::<i64>()
         {
             cfg.residue = n;
         }
-        cfg.residue = cfg.residue.min(RESIDUE_MAX);
+        cfg.residue = clamp_residue(cfg.residue) as i64;
         cfg
     }
 
@@ -383,11 +390,14 @@ fn computed_ctx_pct(cu: Option<&CurrentUsage>, cap: i64) -> Option<f64> {
 fn fmt_delta(d: i64) -> String {
     let a = d.abs();
     if a < 1000 {
-        format!("{:+}", d)
-    } else if a < 10_000 {
-        format!("{:+.1}k", d as f64 / 1000.0)
+        return format!("{:+}", d);
+    }
+    // Round to one decimal first so 9_950 and 10_049 both print as +10k.
+    let k = (d as f64 / 100.0).round() / 10.0;
+    if k.abs() < 10.0 {
+        format!("{k:+.1}k")
     } else {
-        format!("{:+}k", (d as f64 / 1000.0).round() as i64)
+        format!("{:+}k", k.round() as i64)
     }
 }
 
@@ -743,10 +753,8 @@ fn main() {
                 data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
                 data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
             );
-            match (cfg.residue, data.session_id.as_deref()) {
-                (n, Some(sid)) if n > 0 => {
-                    residue_deltas(&conn, sid, n as usize).unwrap_or_default()
-                }
+            match (clamp_residue(cfg.residue), data.session_id.as_deref()) {
+                (n, Some(sid)) if n > 0 => residue_deltas(&conn, sid, n).unwrap_or_default(),
                 _ => Vec::new(),
             }
         })
@@ -950,6 +958,10 @@ fn ensure_schema(conn: &Connection) -> DbResult<()> {
             conn.execute_batch(&format!("ALTER TABLE metrics ADD COLUMN {name} {ty};"))?;
         }
     }
+    // The residue query reads one session's rows newest first.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS metrics_session_id ON metrics(session_id, id);",
+    )?;
     Ok(())
 }
 
@@ -1020,19 +1032,22 @@ fn log_metrics(
 /// Context deltas of the last `n` user turns of `session_id`, oldest first.
 /// Rows without a prompt_id (older Claude Code) each count as a turn.
 fn residue_deltas(conn: &Connection, session_id: &str, n: usize) -> DbResult<Vec<i64>> {
-    // A turn produces one row per API response; 40 rows per turn is a loose
-    // upper bound for a turn full of tool calls.
-    let limit = (n as i64 + 1) * 40;
+    // One row per turn: the last row of each prompt_id. Bounded by turns, so
+    // a turn with any number of API responses never pushes older turns out.
+    let limit = n as i64 + 1;
     let mut stmt = conn.prepare(
-        "SELECT id, prompt_id, content FROM metrics
-         WHERE session_id = ?1 AND content IS NOT NULL
+        "SELECT id, content FROM metrics
+         WHERE id IN (
+             SELECT MAX(id) FROM metrics
+             WHERE session_id = ?1 AND content IS NOT NULL
+             GROUP BY COALESCE(prompt_id, 'row-' || id)
+         )
          ORDER BY id DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![session_id, limit], |row| {
         let id: i64 = row.get(0)?;
-        let prompt: Option<String> = row.get(1)?;
-        let content: i64 = row.get(2)?;
-        Ok((prompt.unwrap_or_else(|| format!("row-{id}")), content))
+        let content: i64 = row.get(1)?;
+        Ok((id.to_string(), content))
     })?;
     let mut newest_first = Vec::new();
     for r in rows {
@@ -1169,12 +1184,27 @@ mod tests {
     }
 
     #[test]
+    fn residue_config_never_breaks_the_rest() {
+        // An out-of-range residue must not fail the whole config and drop bar.
+        let cfg: Config = serde_json::from_str(r#"{"bar": true, "residue": 300}"#).unwrap();
+        assert!(cfg.bar);
+        assert_eq!(clamp_residue(cfg.residue), 10);
+        let cfg: Config = serde_json::from_str(r#"{"glyphs": true, "residue": -1}"#).unwrap();
+        assert!(cfg.glyphs);
+        assert_eq!(clamp_residue(cfg.residue), 0);
+        assert_eq!(clamp_residue(6), 6);
+        assert_eq!(clamp_residue(i64::MAX), 10);
+    }
+
+    #[test]
     fn fmt_delta_shapes() {
         assert_eq!(fmt_delta(0), "+0");
         assert_eq!(fmt_delta(512), "+512");
         assert_eq!(fmt_delta(-900), "-900");
         assert_eq!(fmt_delta(3_140), "+3.1k");
-        assert_eq!(fmt_delta(9_999), "+10.0k");
+        assert_eq!(fmt_delta(9_940), "+9.9k");
+        assert_eq!(fmt_delta(9_999), "+10k", "one shape around 10k");
+        assert_eq!(fmt_delta(10_049), "+10k");
         assert_eq!(fmt_delta(84_200), "+84k");
         assert_eq!(fmt_delta(-120_400), "-120k");
     }
@@ -1281,6 +1311,70 @@ mod tests {
         );
         assert_eq!(residue_deltas(&conn, "s1", 2).unwrap(), vec![4_000, 12_000]);
         assert!(residue_deltas(&conn, "other", 5).unwrap().is_empty());
+
+        // A turn with many API responses must not push older turns out of the
+        // window (review finding: the old row-based limit did).
+        for i in 1..=200_i64 {
+            log_metrics(
+                &conn,
+                "proj",
+                None,
+                Some("Fable"),
+                Some("s1"),
+                Some("p4"),
+                Some(100_000 + i * 10),
+                362_000 + i * 10,
+                1_000 + i,
+                200_000,
+                10.0,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(residue_deltas(&conn, "s1", 1).unwrap(), vec![2_000]);
+        assert_eq!(
+            residue_deltas(&conn, "s1", 4).unwrap(),
+            vec![84_000, 4_000, 12_000, 2_000]
+        );
+
+        // Rows without a prompt_id (older Claude Code) are one turn each.
+        log_metrics(
+            &conn,
+            "proj",
+            None,
+            None,
+            Some("s2"),
+            None,
+            Some(50_000),
+            1,
+            1,
+            200_000,
+            1.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        log_metrics(
+            &conn,
+            "proj",
+            None,
+            None,
+            Some("s2"),
+            None,
+            Some(53_000),
+            2,
+            2,
+            200_000,
+            1.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(residue_deltas(&conn, "s2", 5).unwrap(), vec![50_000, 3_000]);
     }
 
     #[test]
