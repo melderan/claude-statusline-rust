@@ -1497,31 +1497,44 @@ const FLUSH_MAX_BATCHES: usize = 10;
 fn flush_main() {
     let cfg = Config::load();
     let home = home_dir().unwrap_or_default();
-    let Some(recorder) = std::env::var("CSR_RECORDER_DB")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    else {
+    let Some(recorder) = env_nonblank("CSR_RECORDER_DB") else {
         eprintln!("claude-statusline-rust --flush: CSR_RECORDER_DB is not set; nothing to do");
         return;
     };
-    let room = std::env::var("CSR_ROOM")
-        .ok()
-        .or_else(|| std::env::var("SANDBOX_NAME").ok())
-        .filter(|v| !v.trim().is_empty());
-    let Some(room) = room else {
+    // The room is the full sandbox name, never a trimmed tag: two houses can
+    // share one repo, and a tag would fold them into one room.
+    let Some(room) = env_nonblank("CSR_ROOM").or_else(|| env_nonblank("SANDBOX_NAME")) else {
         eprintln!(
             "claude-statusline-rust --flush: CSR_ROOM (or SANDBOX_NAME) is not set; nothing to do"
         );
         return;
     };
     match run_flush(&cfg, &home, &recorder, &room) {
-        Ok(n) => println!("claude-statusline-rust --flush: {n} row(s) to {recorder}"),
+        Ok(n) => println!("claude-statusline-rust --flush: {n} new row(s) in {recorder}"),
         Err(e) => eprintln!("claude-statusline-rust --flush: skipped: {e}"),
     }
 }
 
+/// An environment variable, trimmed, None when unset or blank.
+fn env_nonblank(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn ctx<T>(r: DbResult<T>, what: &str) -> DbResult<T> {
+    r.map_err(|e| -> Box<dyn std::error::Error> { format!("{what}: {e}").into() })
+}
+
+/// Columns of the recorder's `measures` table, in order; shared by the
+/// CREATE and the migration copy so the two cannot drift.
+const MEASURES_COLUMNS: &str =
+    "ts, room, source, buffer, source_id, session_id, prompt_id, kind, key, value, unit, data";
+
 /// Open the recorder the house way: dotfile lock, rollback journal, a few
-/// seconds of patience, no lock removal. Creates the table and indexes.
+/// seconds of patience, no lock removal. Creates the table and indexes, and
+/// migrates a table from before the `buffer` column (rows get buffer 'v0').
 fn open_recorder(path: &str) -> DbResult<Connection> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1529,13 +1542,13 @@ fn open_recorder(path: &str) -> DbResult<Connection> {
     let conn =
         Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), "unix-dotfile")?;
     conn.busy_timeout(RECORDER_BUSY_TIMEOUT)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;
-         CREATE TABLE IF NOT EXISTS measures (
+    conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
+    let create = "CREATE TABLE IF NOT EXISTS measures (
             id         INTEGER PRIMARY KEY,
             ts         TEXT NOT NULL,
             room       TEXT NOT NULL,
             source     TEXT NOT NULL,
+            buffer     TEXT NOT NULL,
             source_id  INTEGER NOT NULL,
             session_id TEXT,
             prompt_id  TEXT,
@@ -1544,13 +1557,86 @@ fn open_recorder(path: &str) -> DbResult<Connection> {
             value      REAL,
             unit       TEXT,
             data       TEXT,
-            UNIQUE(room, source, source_id)
+            UNIQUE(room, source, buffer, source_id)
          );
          CREATE INDEX IF NOT EXISTS measures_room_ts ON measures(room, ts);
          CREATE INDEX IF NOT EXISTS measures_kind_key_ts ON measures(kind, key, ts);
-         CREATE INDEX IF NOT EXISTS measures_session_prompt ON measures(session_id, prompt_id);",
-    )?;
+         CREATE INDEX IF NOT EXISTS measures_session_prompt ON measures(session_id, prompt_id);";
+    let has_table: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='measures'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if has_table {
+        let mut cols: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(measures)")?;
+            for c in stmt.query_map([], |r| r.get::<_, String>(1))? {
+                cols.push(c?);
+            }
+        }
+        if !cols.iter().any(|c| c == "buffer") {
+            let old_cols = MEASURES_COLUMNS.replace("buffer, ", "");
+            conn.execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE measures RENAME TO measures_v0;
+                 {create}
+                 INSERT OR IGNORE INTO measures ({MEASURES_COLUMNS})
+                   SELECT {} FROM measures_v0;
+                 DROP TABLE measures_v0;
+                 COMMIT;",
+                old_cols.replace("source, ", "source, 'v0', ")
+            ))?;
+            return Ok(conn);
+        }
+    }
+    conn.execute_batch(create)?;
     Ok(conn)
+}
+
+/// The local file's identity: a random id minted the first time the file is
+/// used for a flush and kept in it. A rebuilt room starts its local ids at 1
+/// again, so (room, source, source_id) alone would collide with the old
+/// life's rows; the buffer id tells the lives apart.
+fn buffer_id(local: &Connection) -> DbResult<String> {
+    local.execute_batch(
+        "CREATE TABLE IF NOT EXISTS buffer_identity (
+            id      TEXT PRIMARY KEY,
+            created TEXT NOT NULL
+         );",
+    )?;
+    match local.query_row("SELECT id FROM buffer_identity LIMIT 1", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(id) => Ok(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            let id = mint_id();
+            local.execute(
+                "INSERT INTO buffer_identity (id, created) VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                [&id],
+            )?;
+            Ok(id)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 32 hex characters from the OS random source, or from time and pid when
+/// that is unavailable.
+fn mint_id() -> String {
+    let mut bytes = [0u8; 16];
+    let got = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok();
+    if !got {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mix = t ^ ((std::process::id() as u128) << 64);
+        bytes = mix.to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The local high-water mark per recorder path.
@@ -1565,24 +1651,31 @@ fn ensure_flush_state(local: &Connection) -> DbResult<()> {
     Ok(())
 }
 
+/// No mark yet is 0; a read error is an error, not a flush-everything-again.
 fn last_flushed_id(local: &Connection, target: &str) -> DbResult<i64> {
     ensure_flush_state(local)?;
-    Ok(local
-        .query_row(
-            "SELECT last_id FROM flush_state WHERE target = ?1",
-            [target],
-            |r| r.get(0),
-        )
-        .unwrap_or(0))
+    match local.query_row(
+        "SELECT last_id FROM flush_state WHERE target = ?1",
+        [target],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(v) => Ok(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
 }
 
-/// ISO 8601 UTC with milliseconds; rows from before the millisecond format
-/// get ".000Z" so every recorder row has one shape.
+/// ISO 8601 UTC with milliseconds. Local rows from before the millisecond
+/// format get ".000Z"; a space-separated stamp gets its T; a fraction with
+/// no zone gets its Z.
 fn recorder_ts(local_ts: &str) -> String {
-    if local_ts.ends_with('Z') {
-        local_ts.to_string()
+    let t = local_ts.trim().replacen(' ', "T", 1);
+    if t.ends_with('Z') {
+        t
+    } else if t.len() == 19 {
+        format!("{t}.000Z")
     } else {
-        format!("{local_ts}.000Z")
+        format!("{t}Z")
     }
 }
 
@@ -1594,7 +1687,10 @@ struct LocalRow {
     prompt_id: Option<String>,
     content: Option<i64>,
     always_on_chars: Option<i64>,
+    /// The call's numbers; the always-on file list stays out of it and rides
+    /// on the always_on change row instead, which keeps the call row small.
     data: serde_json::Value,
+    files: serde_json::Value,
 }
 
 fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec<LocalRow>> {
@@ -1625,7 +1721,6 @@ fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec<LocalRow>>
             "rate_7d_pct": r.get::<_, Option<f64>>(15)?,
             "rate_7d_resets": r.get::<_, Option<i64>>(16)?,
             "always_on_chars": r.get::<_, Option<i64>>(17)?,
-            "always_on_files": files,
         });
         Ok(LocalRow {
             id: r.get(0)?,
@@ -1635,6 +1730,7 @@ fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec<LocalRow>>
             content: r.get(7)?,
             always_on_chars: r.get(17)?,
             data,
+            files,
         })
     })?;
     let mut out = Vec::new();
@@ -1645,16 +1741,27 @@ fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec<LocalRow>>
 }
 
 /// Copy local rows newer than the last flushed id into the recorder. Returns
-/// the number of local rows flushed. One call row per local row
-/// (kind=statusline, key=call, value=content tokens, the rest as JSON) and,
-/// whenever the always-on count differs from the previous local row, one
-/// scalar row (kind=always_on, key=chars) so the change is a plain series.
+/// the number of recorder rows actually inserted (a re-flush after a lost
+/// mark inserts none). One call row per local row (kind=statusline,
+/// key=call, value=content tokens, the numbers as JSON) and, whenever the
+/// always-on count differs from the previous local row, one scalar row
+/// (kind=always_on, key=chars, the file list as JSON) so the change is a
+/// plain series.
 fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbResult<usize> {
-    let local = open_metrics_db(cfg, home)?;
-    let recorder = open_recorder(recorder_path)?;
-    let mut total = 0usize;
+    let local = ctx(open_metrics_db(cfg, home), "local metrics file")?;
+    let buffer = ctx(buffer_id(&local), "local metrics file")?;
+    let recorder = ctx(
+        open_recorder(recorder_path),
+        &format!("recorder {recorder_path}"),
+    )?;
+    // The mark is keyed by the recorder's real path, so two spellings of one
+    // file share one mark.
+    let target = std::fs::canonicalize(recorder_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| recorder_path.to_string());
+    let mut inserted = 0usize;
     for _ in 0..FLUSH_MAX_BATCHES {
-        let last = last_flushed_id(&local, recorder_path)?;
+        let last = last_flushed_id(&local, &target)?;
         let rows = read_local_rows(&local, last)?;
         if rows.is_empty() {
             break;
@@ -1667,18 +1774,22 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
                 |r| r.get(0),
             )
             .ok();
-        let tx = recorder.unchecked_transaction()?;
+        let tx = ctx(
+            recorder.unchecked_transaction().map_err(Into::into),
+            &format!("recorder {recorder_path}"),
+        )?;
         {
-            let mut ins = tx.prepare(
-                "INSERT OR IGNORE INTO measures (ts, room, source, source_id, session_id, prompt_id, kind, key, value, unit, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
+            let mut ins = tx.prepare(&format!(
+                "INSERT OR IGNORE INTO measures ({MEASURES_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            ))?;
             for r in &rows {
                 let ts = recorder_ts(&r.ts);
-                ins.execute(rusqlite::params![
+                inserted += ins.execute(rusqlite::params![
                     ts,
                     room,
                     "statusline",
+                    buffer,
                     r.id,
                     r.session_id,
                     r.prompt_id,
@@ -1691,10 +1802,11 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
                 if let Some(on) = r.always_on_chars
                     && prev_on != Some(on)
                 {
-                    ins.execute(rusqlite::params![
+                    inserted += ins.execute(rusqlite::params![
                         ts,
                         room,
                         "statusline.always_on",
+                        buffer,
                         r.id,
                         r.session_id,
                         r.prompt_id,
@@ -1702,25 +1814,29 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
                         "chars",
                         on as f64,
                         "chars",
-                        r.data.get("always_on_files").map(|v| v.to_string()),
+                        r.files.to_string(),
                     ])?;
                     prev_on = Some(on);
                 }
             }
         }
-        tx.commit()?;
+        ctx(
+            tx.commit().map_err(Into::into),
+            &format!("recorder {recorder_path}"),
+        )?;
         let new_last = rows.last().map(|r| r.id).unwrap_or(last);
+        // Two flushes at once may finish out of order; the mark only moves forward.
         local.execute(
             "INSERT INTO flush_state (target, last_id, ts) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-             ON CONFLICT(target) DO UPDATE SET last_id = excluded.last_id, ts = excluded.ts",
-            rusqlite::params![recorder_path, new_last],
+             ON CONFLICT(target) DO UPDATE SET
+               last_id = MAX(flush_state.last_id, excluded.last_id), ts = excluded.ts",
+            rusqlite::params![target, new_last],
         )?;
-        total += rows.len();
         if (rows.len() as i64) < FLUSH_BATCH {
             break;
         }
     }
-    Ok(total)
+    Ok(inserted)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2347,8 +2463,10 @@ mod tests {
 
     #[test]
     fn metrics_db_env_override() {
-        let mut cfg = Config::default();
-        cfg.metrics_db = Some("/from/file.sqlite".into());
+        let mut cfg = Config {
+            metrics_db: Some("/from/file.sqlite".into()),
+            ..Config::default()
+        };
         cfg.apply_metrics_env(Some("   ".into()));
         assert_eq!(
             cfg.metrics_db.as_deref(),
@@ -2359,8 +2477,10 @@ mod tests {
         assert_eq!(cfg.metrics_db.as_deref(), Some("/from/file.sqlite"));
         cfg.apply_metrics_env(Some("/from/env.sqlite".into()));
         assert_eq!(cfg.metrics_db.as_deref(), Some("/from/env.sqlite"));
-        let mut blank = Config::default();
-        blank.metrics_db = Some("".into());
+        let mut blank = Config {
+            metrics_db: Some("".into()),
+            ..Config::default()
+        };
         blank.apply_metrics_env(None);
         assert_eq!(blank.metrics_db, None, "blank in the file means unset");
     }
@@ -2393,8 +2513,10 @@ mod tests {
     #[test]
     fn open_metrics_db_creates_the_parent_directory() {
         let dir = fresh_dir("home");
-        let mut cfg = Config::default();
-        cfg.metrics_db = Some("state/deep/metrics.sqlite".into());
+        let cfg = Config {
+            metrics_db: Some("state/deep/metrics.sqlite".into()),
+            ..Config::default()
+        };
         let conn = open_metrics_db(&cfg, &dir.to_string_lossy()).unwrap();
         drop(conn);
         assert!(
@@ -2525,53 +2647,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn log_row(conn: &Connection, prompt: &str, content: i64, n: i64, on: &AlwaysOn) {
+        log_metrics(
+            conn,
+            "proj",
+            Some("main"),
+            Some("Fable"),
+            Some("s1"),
+            Some(prompt),
+            Some(content),
+            content,
+            n,
+            200_000,
+            10.0,
+            Some(0.5),
+            None,
+            None,
+            Some(on),
+        )
+        .unwrap();
+    }
+
+    fn on(chars: u64) -> AlwaysOn {
+        AlwaysOn {
+            chars,
+            files: vec![("/a/CLAUDE.md".to_string(), chars)],
+        }
+    }
+
     #[test]
     fn flush_copies_new_rows_once_and_skips_a_held_lock() {
         let dir = fresh_dir("flush");
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_string_lossy().to_string();
         let cfg = Config::default(); // local file under home/.config/dbg, WAL
         let recorder = dir.join("house").join("recorder.sqlite");
         let rp = recorder.to_string_lossy().to_string();
-        let on1 = AlwaysOn {
-            chars: 100,
-            files: vec![("/a/CLAUDE.md".to_string(), 100)],
-        };
-        let on2 = AlwaysOn {
-            chars: 120,
-            files: vec![("/a/CLAUDE.md".to_string(), 120)],
-        };
         {
-            let local = open_metrics_db(&cfg, &home.to_string_lossy()).unwrap();
-            let mut n = 0;
-            let mut log = |prompt: &str, content: i64, on: &AlwaysOn| {
-                n += 1;
-                log_metrics(
-                    &local,
-                    "proj",
-                    Some("main"),
-                    Some("Fable"),
-                    Some("s1"),
-                    Some(prompt),
-                    Some(content),
-                    content,
-                    n,
-                    200_000,
-                    10.0,
-                    Some(0.5),
-                    None,
-                    None,
-                    Some(on),
-                )
-                .unwrap();
-            };
-            log("p1", 84_000, &on1);
-            log("p2", 88_000, &on1);
-            log("p3", 90_000, &on2);
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            log_row(&local, "p1", 84_000, 1, &on(100));
+            log_row(&local, "p2", 88_000, 2, &on(100));
+            log_row(&local, "p3", 90_000, 3, &on(120));
         }
-        // First flush: three call rows, two always_on rows (100, then 120).
-        let n = run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA").unwrap();
-        assert_eq!(n, 3);
+        // First flush: three call rows plus two always_on rows (100, then 120).
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 5);
         let rec = open_recorder(&rp).unwrap();
         let count = |sql: &str| -> i64 { rec.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(
@@ -2582,11 +2702,11 @@ mod tests {
             count("SELECT COUNT(*) FROM measures WHERE kind='always_on'"),
             2
         );
-        let (ts, room, value, unit, data): (String, String, f64, String, String) = rec
-            .query_row(
-                "SELECT ts, room, value, unit, data FROM measures WHERE kind='statusline' ORDER BY source_id DESC LIMIT 1",
+        let (ts, room, buffer, value, unit, data): (String, String, String, f64, String, String) =
+            rec.query_row(
+                "SELECT ts, room, buffer, value, unit, data FROM measures WHERE kind='statusline' ORDER BY source_id DESC LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .unwrap();
         assert!(
@@ -2594,110 +2714,187 @@ mod tests {
             "ISO UTC with milliseconds: {ts}"
         );
         assert_eq!(room, "roomA");
+        assert_eq!(buffer.len(), 32);
         assert_eq!(value, 90_000.0);
         assert_eq!(unit, "tokens");
         let d: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(d["always_on_chars"], 120);
-        assert_eq!(d["always_on_files"][0][1], 120);
         assert_eq!(d["model"], "Fable");
+        assert!(
+            d.get("always_on_files").is_none(),
+            "the file list rides on the always_on row"
+        );
+        let files: String = rec
+            .query_row(
+                "SELECT data FROM measures WHERE kind='always_on' ORDER BY source_id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(files.contains("/a/CLAUDE.md"));
 
         // Second flush: nothing new.
-        assert_eq!(
-            run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA").unwrap(),
-            0
-        );
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 0);
         assert_eq!(count("SELECT COUNT(*) FROM measures"), 5);
 
-        // A flush that lost its mark (killed before the update) writes nothing twice.
+        // A flush that lost its mark (killed before the update) inserts nothing twice.
         {
-            let local = open_metrics_db(&cfg, &home.to_string_lossy()).unwrap();
+            let local = open_metrics_db(&cfg, &h).unwrap();
             local
                 .execute("UPDATE flush_state SET last_id = 0", [])
                 .unwrap();
         }
         assert_eq!(
-            run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA").unwrap(),
-            3
+            run_flush(&cfg, &h, &rp, "roomA").unwrap(),
+            0,
+            "reported count is rows inserted"
         );
-        assert_eq!(
-            count("SELECT COUNT(*) FROM measures"),
-            5,
-            "INSERT OR IGNORE keeps it idempotent"
-        );
+        assert_eq!(count("SELECT COUNT(*) FROM measures"), 5);
 
-        // New local rows after the mark flush alone; another room's rows do not collide.
+        // New local rows after the mark flush alone (same always-on, so no change row).
         {
-            let local = open_metrics_db(&cfg, &home.to_string_lossy()).unwrap();
-            log_metrics(
-                &local,
-                "proj",
-                None,
-                None,
-                Some("s1"),
-                Some("p4"),
-                Some(95_000),
-                95_000,
-                9,
-                200_000,
-                10.0,
-                None,
-                None,
-                None,
-                Some(&on2),
-            )
-            .unwrap();
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            log_row(&local, "p4", 95_000, 4, &on(120));
         }
-        assert_eq!(
-            run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA").unwrap(),
-            1
-        );
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 1);
         assert_eq!(count("SELECT COUNT(*) FROM measures"), 6);
         drop(rec);
 
-        // Recorder lock held by someone else: skip, no removal, mark unchanged.
+        // Recorder lock held by someone else: skip, no removal, mark unchanged, message names the recorder.
         let lock = format!("{rp}.lock");
         std::fs::create_dir_all(&lock).unwrap();
         {
-            let local = open_metrics_db(&cfg, &home.to_string_lossy()).unwrap();
-            log_metrics(
-                &local,
-                "proj",
-                None,
-                None,
-                Some("s1"),
-                Some("p5"),
-                Some(97_000),
-                97_000,
-                10,
-                200_000,
-                10.0,
-                None,
-                None,
-                None,
-                Some(&on2),
-            )
-            .unwrap();
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            log_row(&local, "p5", 97_000, 5, &on(120));
         }
         let t0 = std::time::Instant::now();
-        assert!(run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA").is_err());
+        let err = run_flush(&cfg, &h, &rp, "roomA").unwrap_err().to_string();
+        assert!(err.starts_with("recorder "), "which file was locked: {err}");
         assert!(t0.elapsed() < std::time::Duration::from_secs(10));
         assert!(
             std::path::Path::new(&lock).is_dir(),
             "the lock is not ours to remove"
         );
         {
-            let local = open_metrics_db(&cfg, &home.to_string_lossy()).unwrap();
+            let local = open_metrics_db(&cfg, &h).unwrap();
             let last: i64 = local
                 .query_row("SELECT last_id FROM flush_state", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(last, 4, "mark unchanged by a skipped flush");
         }
         std::fs::remove_dir_all(&lock).unwrap();
-        assert_eq!(
-            run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA").unwrap(),
-            1
-        );
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 1);
         assert!(!dir.join("house").join("recorder.sqlite-wal").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_tells_a_rebuilt_room_apart() {
+        // Review HIGH: a rebuilt room restarts local ids at 1; without the
+        // buffer id its rows collided on the unique key and were dropped.
+        let dir = fresh_dir("rebuilt");
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        let cfg = Config::default();
+        let life = |name: &str, rows: &[(&str, i64)]| -> String {
+            let home = dir.join(name);
+            std::fs::create_dir_all(&home).unwrap();
+            let h = home.to_string_lossy().to_string();
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            for (i, (p, c)) in rows.iter().enumerate() {
+                log_row(&local, p, *c, i as i64 + 1, &on(100));
+            }
+            h
+        };
+        let h1 = life("life1", &[("p1", 84_000), ("p2", 88_000), ("p3", 90_000)]);
+        let h2 = life("life2", &[("q1", 50_000), ("q2", 52_000)]);
+        assert_eq!(run_flush(&cfg, &h1, &rp, "roomA").unwrap(), 4); // 3 calls + 1 always_on
+        assert_eq!(run_flush(&cfg, &h2, &rp, "roomA").unwrap(), 3); // 2 calls + 1 always_on
+        let rec = open_recorder(&rp).unwrap();
+        let calls: i64 = rec
+            .query_row(
+                "SELECT COUNT(*) FROM measures WHERE kind='statusline'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let buffers: i64 = rec
+            .query_row("SELECT COUNT(DISTINCT buffer) FROM measures", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(calls, 5, "both lives' rows land");
+        assert_eq!(buffers, 2);
+        // The buffer id is stable across opens of the same file.
+        let local = open_metrics_db(&cfg, &h1).unwrap();
+        assert_eq!(buffer_id(&local).unwrap(), buffer_id(&local).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_marks_are_per_recorder_and_the_source_is_the_configured_file() {
+        let dir = fresh_dir("marks");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_string_lossy().to_string();
+        // The local file is the configured one, not the default path.
+        let cfg = Config {
+            metrics_db: Some(dir.join("local.sqlite").to_string_lossy().to_string()),
+            ..Config::default()
+        };
+        {
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            log_row(&local, "p1", 84_000, 1, &on(100));
+            log_row(&local, "p2", 88_000, 2, &on(100));
+        }
+        assert!(
+            !home.join(".config").join("dbg").exists(),
+            "default file untouched"
+        );
+        let ra = dir.join("a.sqlite").to_string_lossy().to_string();
+        let rb = dir.join("b.sqlite").to_string_lossy().to_string();
+        assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap(), 3);
+        assert_eq!(
+            run_flush(&cfg, &h, &rb, "roomA").unwrap(),
+            3,
+            "a second recorder has its own mark"
+        );
+        assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap(), 0);
+        // Two spellings of one recorder path share one mark.
+        let ra2 = dir.join(".").join("a.sqlite").to_string_lossy().to_string();
+        assert_eq!(run_flush(&cfg, &h, &ra2, "roomA").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recorder_migrates_a_table_without_buffer() {
+        let dir = fresh_dir("migrate");
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        {
+            let conn = Connection::open_with_flags_and_vfs(
+                &rp,
+                rusqlite::OpenFlags::default(),
+                "unix-dotfile",
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE measures (id INTEGER PRIMARY KEY, ts TEXT NOT NULL, room TEXT NOT NULL,
+                   source TEXT NOT NULL, source_id INTEGER NOT NULL, session_id TEXT, prompt_id TEXT,
+                   kind TEXT NOT NULL, key TEXT NOT NULL, value REAL, unit TEXT, data TEXT,
+                   UNIQUE(room, source, source_id));
+                 INSERT INTO measures (ts, room, source, source_id, kind, key, value) VALUES
+                   ('2026-10-02T00:00:00.000Z', 'r', 'statusline', 1, 'statusline', 'call', 1.0);",
+            )
+            .unwrap();
+        }
+        let rec = open_recorder(&rp).unwrap();
+        let (n, buffer): (i64, String) = rec
+            .query_row("SELECT COUNT(*), MIN(buffer) FROM measures", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((n, buffer.as_str()), (1, "v0"));
+        drop(rec);
+        let _ = open_recorder(&rp).unwrap(); // idempotent
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2711,6 +2908,23 @@ mod tests {
             recorder_ts("2026-10-02T18:00:00.123Z"),
             "2026-10-02T18:00:00.123Z"
         );
+        assert_eq!(
+            recorder_ts("2026-10-02 18:00:00"),
+            "2026-10-02T18:00:00.000Z"
+        );
+        assert_eq!(
+            recorder_ts("2026-10-02T18:00:00.123"),
+            "2026-10-02T18:00:00.123Z"
+        );
+    }
+
+    #[test]
+    fn mint_id_is_hex_and_unique() {
+        let a = mint_id();
+        let b = mint_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 
     #[test]
