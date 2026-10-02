@@ -192,15 +192,20 @@ fn fmt_duration_ms(ms: i64) -> String {
     }
 }
 
+/// Bytes on disk. The unit always says "B" so it cannot be read as tokens:
+/// the ctx line one row below uses a bare "k" for thousands of tokens.
 fn fmt_bytes(b: u64) -> String {
     if b == 0 {
         "-".to_string()
     } else if b < 1024 {
         format!("{}B", b)
-    } else if b < 1024 * 1024 {
-        format!("{:.1}k", b as f64 / 1024.0)
     } else {
-        format!("{:.1}M", b as f64 / (1024.0 * 1024.0))
+        let kb = (b as f64 / 1024.0).round();
+        if kb < 1024.0 {
+            format!("{kb:.0}KB")
+        } else {
+            format!("{:.1}MB", b as f64 / (1024.0 * 1024.0))
+        }
     }
 }
 
@@ -401,30 +406,72 @@ fn path_to_memory_slug(abs_path: &str) -> String {
 }
 
 /// Returns (MEMORY.md bytes, other-memory-files bytes).
+///
+/// Only the top-level MEMORY.md is loaded at session start; every other
+/// `.md` under the memory directory, at any depth, is reachable by recall,
+/// so the second number walks subdirectories too.
 fn memory_bytes(project_dir: &str) -> (u64, u64) {
     let home = match home_dir() {
         Some(h) => h,
         None => return (0, 0),
     };
     let slug = path_to_memory_slug(project_dir);
-    let dir = format!("{}/.claude/projects/{}/memory", home, slug);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return (0, 0),
-    };
+    let dir = std::path::PathBuf::from(format!("{}/.claude/projects/{}/memory", home, slug));
+    memory_bytes_in(&dir)
+}
+
+/// Depth limit for the memory walk; no sane memory tree is this deep, and it
+/// bounds the work even if the visited set misses a loop.
+const MEMORY_WALK_MAX_DEPTH: usize = 8;
+
+fn memory_bytes_in(dir: &std::path::Path) -> (u64, u64) {
     let mut index = 0u64;
     let mut other = 0u64;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".md") {
-            continue;
+    // Symlinks are followed (the memory directory may itself be a link), so
+    // remember each real path, directory or file, and count it once: a link
+    // back up the tree cannot loop, and a file reached twice is one file.
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
+    while let Some((path, depth)) = stack.pop() {
+        match std::fs::canonicalize(&path) {
+            Ok(real) => {
+                if !seen.insert(real) {
+                    continue;
+                }
+            }
+            Err(_) => continue,
         }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if name_str == "MEMORY.md" {
-            index += size;
-        } else {
-            other += size;
+        let entries = match std::fs::read_dir(&path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // DirEntry::metadata does not follow a symlink; fs::metadata does.
+            let meta = match std::fs::metadata(entry.path()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                if depth < MEMORY_WALK_MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if !name_str.ends_with(".md") {
+                continue;
+            }
+            if let Ok(real) = std::fs::canonicalize(entry.path())
+                && !seen.insert(real)
+            {
+                continue;
+            }
+            if depth == 0 && name_str == "MEMORY.md" {
+                index += meta.len();
+            } else {
+                other += meta.len();
+            }
         }
     }
     (index, other)
@@ -915,8 +962,15 @@ mod tests {
     fn bytes_formatting() {
         assert_eq!(fmt_bytes(0), "-");
         assert_eq!(fmt_bytes(512), "512B");
-        assert_eq!(fmt_bytes(1536), "1.5k");
-        assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0M");
+        assert_eq!(fmt_bytes(1536), "2KB");
+        assert_eq!(
+            fmt_bytes(25_363),
+            "25KB",
+            "MEMORY.md-sized index reads as KB, not tokens"
+        );
+        assert_eq!(fmt_bytes(371_005), "362KB");
+        assert_eq!(fmt_bytes(1_048_575), "1.0MB", "never 1024KB");
+        assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0MB");
     }
 
     #[test]
@@ -1010,6 +1064,58 @@ mod tests {
         assert!(!cfg.bar, "bar should be opt-in");
         assert!(!cfg.glyphs, "glyphs should be opt-in");
         assert!(cfg.color, "color should be on by default");
+    }
+
+    #[test]
+    fn memory_bytes_walks_subdirectories() {
+        let root = std::env::temp_dir().join(format!(
+            "csr-mem-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let rooms = root.join("rooms").join("tts");
+        std::fs::create_dir_all(&rooms).unwrap();
+        std::fs::write(root.join("MEMORY.md"), vec![b'x'; 100]).unwrap();
+        std::fs::write(root.join("a.md"), vec![b'x'; 10]).unwrap();
+        std::fs::write(root.join("notes.txt"), vec![b'x'; 1000]).unwrap();
+        std::fs::write(rooms.join("b.md"), vec![b'x'; 20]).unwrap();
+        // A nested MEMORY.md is an ordinary file, not the index.
+        std::fs::write(rooms.join("MEMORY.md"), vec![b'x'; 30]).unwrap();
+        let (idx, other) = memory_bytes_in(&root);
+        assert_eq!(idx, 100);
+        assert_eq!(other, 60, "a.md + rooms/tts/b.md + rooms/tts/MEMORY.md");
+        assert_eq!(memory_bytes_in(&root.join("missing")), (0, 0));
+
+        // Symlinks: a linked file counts, a linked directory is walked, and a
+        // link back to the root neither loops nor double-counts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = root
+                .join("..")
+                .join(format!("csr-mem-outside-{}", std::process::id()));
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("far.md"), vec![b'x'; 7]).unwrap();
+            symlink(outside.join("far.md"), root.join("link.md")).unwrap();
+            symlink(&outside, root.join("linked-dir")).unwrap();
+            symlink(&root, rooms.join("loop")).unwrap();
+            let (idx, other) = memory_bytes_in(&root);
+            assert_eq!(idx, 100);
+            assert_eq!(
+                other,
+                60 + 7,
+                "link.md and linked-dir/far.md are one file, counted once"
+            );
+            // The memory directory itself may be a symlink (the house layout).
+            let link_to_root = outside.join("memory");
+            symlink(&root, &link_to_root).unwrap();
+            assert_eq!(memory_bytes_in(&link_to_root), (100, 67));
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
