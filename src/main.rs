@@ -3100,6 +3100,35 @@ mod tests {
     }
 
     #[test]
+    fn flush_treats_an_unreadable_previous_always_on_as_an_error() {
+        let dir = fresh_dir("prevon");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_string_lossy().to_string();
+        let cfg = Config::default();
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        {
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            log_row(&local, "p1", 84_000, 1, &on(100));
+        }
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 2);
+        {
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            // SQLite keeps text in an INTEGER column; the previous-value read then fails.
+            local
+                .execute(
+                    "UPDATE metrics SET always_on_chars = 'bogus' WHERE id = 1",
+                    [],
+                )
+                .unwrap();
+            log_row(&local, "p2", 88_000, 2, &on(100));
+        }
+        let err = run_flush(&cfg, &h, &rp, "roomA").unwrap_err().to_string();
+        assert!(err.starts_with("local metrics file "), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn buffer_id_is_minted_once_under_concurrent_first_flushes() {
         let dir = fresh_dir("mint");
         let path = dir.join("local.sqlite");
