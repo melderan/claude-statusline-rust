@@ -3406,6 +3406,22 @@ mod tests {
         assert!(e.contains("UNIQUE(room, source, buffer, source_id)"), "{e}");
         let e = recorder_shape("k-none", &format!("CREATE TABLE measures ({COLS});")).unwrap_err();
         assert!(e.contains("no such index"), "{e}");
+        // A held lock is reported as such, without the WAL hint; a recorder
+        // left in WAL mode gets the hint.
+        let dir = fresh_dir("k-hints");
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        drop(open_recorder(&rp).unwrap());
+        std::fs::create_dir_all(format!("{rp}.lock")).unwrap();
+        let e = open_recorder(&rp).unwrap_err().to_string();
+        assert!(e.contains("locked") && !e.contains("WAL mode"), "{e}");
+        std::fs::remove_dir_all(format!("{rp}.lock")).unwrap();
+        {
+            let c = Connection::open(&rp).unwrap();
+            c.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO measures (ts, room, source, buffer, source_id, kind, key) VALUES ('t','r','s','b',1,'k','v');").unwrap();
+        }
+        let e = open_recorder(&rp).unwrap_err().to_string();
+        assert!(e.contains("WAL mode"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
         // DESC on a key column is still the key; a covering index with a loose collation is not.
         recorder_shape(
             "k-desc",
@@ -3420,34 +3436,10 @@ mod tests {
         assert!(e.contains("collation") && e.contains("room"), "{e}");
     }
 
-    #[test]
-    fn first_openers_of_a_new_file_all_succeed() {
-        // PRAGMA journal_mode=WAL on a brand-new file answers BUSY without the
-        // busy handler; without the retry, concurrent first opens skip.
-        for round in 0..5 {
-            let dir = fresh_dir(&format!("firstopen{round}"));
-            let path = dir.join("metrics.db").to_string_lossy().to_string();
-            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-            let handles: Vec<_> = (0..8)
-                .map(|_| {
-                    let p = path.clone();
-                    let b = barrier.clone();
-                    std::thread::spawn(move || {
-                        b.wait();
-                        open_metrics_at(&p, false, std::time::Duration::from_secs(3))
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
-                    })
-                })
-                .collect();
-            let failures: Vec<String> = handles
-                .into_iter()
-                .filter_map(|h| h.join().unwrap().err())
-                .collect();
-            let _ = std::fs::remove_dir_all(&dir);
-            assert!(failures.is_empty(), "round {round}: {failures:?}");
-        }
-    }
+    // The brand-new-file race (PRAGMA journal_mode=WAL answering BUSY without
+    // the busy handler) does not show between connections of one process,
+    // which share SQLite's lock state; tests/cli.rs reproduces it with
+    // concurrent processes.
 
     #[test]
     fn complete_schema_needs_no_write_lock() {

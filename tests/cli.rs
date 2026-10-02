@@ -137,3 +137,59 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn first_renders_of_a_rooms_life_all_write() {
+    // PRAGMA journal_mode=WAL on a brand-new file answers BUSY without the
+    // busy handler, so concurrent first renders used to skip their rows.
+    // Separate connections in one process share SQLite's lock state and do
+    // not show it; processes do.
+    for round in 0..4 {
+        let dir = fresh_dir(&format!("firstlife{round}"));
+        let mut children: Vec<std::process::Child> = (0..8)
+            .map(|i| {
+                let mut cmd = Command::new(BIN);
+                cmd.env_clear()
+                    .env("HOME", &dir)
+                    .env("NO_COLOR", "1")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = cmd.spawn().unwrap();
+                let hook = HOOK
+                    .replace("\"prompt_id\":\"p\"", &format!("\"prompt_id\":\"p{i}\""))
+                    .replace("84000", &format!("{}", 84_000 + i * 100));
+                {
+                    use std::io::Write;
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(hook.as_bytes())
+                        .unwrap();
+                }
+                child
+            })
+            .collect();
+        let mut errs = Vec::new();
+        for c in children.drain(..) {
+            let out = c.wait_with_output().unwrap();
+            assert_eq!(out.status.code(), Some(0));
+            let e = String::from_utf8_lossy(&out.stderr).into_owned();
+            if !e.is_empty() {
+                errs.push(e);
+            }
+        }
+        let db = dir
+            .join(".config")
+            .join("dbg")
+            .join("statusline-metrics.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metrics", [], |r| r.get(0))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(errs.is_empty(), "round {round}: {errs:?}");
+        assert_eq!(rows, 8, "round {round}: every first render writes its row");
+    }
+}
