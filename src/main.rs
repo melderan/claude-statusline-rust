@@ -22,6 +22,9 @@ struct Input {
     rate_limits: Option<RateLimits>,
     subagents: Option<Subagents>,
     version: Option<String>,
+    session_id: Option<String>,
+    /// UUID of the user prompt being processed; one value per user turn.
+    prompt_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,7 +121,7 @@ fn detect_width() -> usize {
 // on numeric values only (percentages, ages). Config file lives at
 // ~/.config/claude-statusline-rust/config.json; env vars override.
 
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Deserialize, Debug, Clone)]
 struct Config {
     #[serde(default)]
     bar: bool,
@@ -126,6 +129,37 @@ struct Config {
     glyphs: bool,
     #[serde(default = "default_true")]
     color: bool,
+    /// Residue line: how many recent user turns to show with their context
+    /// cost (`res: +84k +3.1k ...`). 0 (the default) hides the line. Any JSON
+    /// value is accepted here, a number or a numeric string, and clamped in
+    /// code to 0..=RESIDUE_MAX by residue_turns(); anything else means 0. A
+    /// bad value never fails the whole config and drops the other settings.
+    /// The numbers sum to less than the ctx figure by the fixed baseline that
+    /// ctx adds for the system prompt and tools.
+    #[serde(default)]
+    residue: serde_json::Value,
+}
+
+/// Longest residue window; past ten turns the line stops being readable.
+const RESIDUE_MAX: i64 = 10;
+
+fn clamp_residue(n: i64) -> usize {
+    n.clamp(0, RESIDUE_MAX) as usize
+}
+
+/// Turns in the residue window from any JSON value: 6, 6.0, "6", 300 (10),
+/// -1 (0), 1e30 (10), "x" (0), null (0).
+fn residue_turns(v: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    let n: Option<f64> = match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    match n {
+        Some(f) if f.is_finite() => clamp_residue(f.clamp(0.0, RESIDUE_MAX as f64) as i64),
+        _ => 0,
+    }
 }
 
 fn default_true() -> bool {
@@ -138,6 +172,7 @@ impl Default for Config {
             bar: false,
             glyphs: false,
             color: true,
+            residue: serde_json::Value::from(0),
         }
     }
 }
@@ -162,6 +197,10 @@ impl Config {
         if let Ok(v) = std::env::var("CSR_COLOR") {
             cfg.color = truthy(&v);
         }
+        if let Ok(v) = std::env::var("CSR_RESIDUE") {
+            cfg.residue = serde_json::Value::from(v);
+        }
+        cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);
         cfg
     }
 
@@ -345,22 +384,70 @@ fn context_bar_plain(width: usize, pct: i32) -> String {
     s
 }
 
-/// Baseline-corrected context percent (matches /context more closely than raw used_percentage).
-fn computed_ctx_pct(cu: Option<&CurrentUsage>, cap: i64) -> Option<f64> {
+/// Tokens in the context after the most recent API response: everything the
+/// model read plus what it wrote. None when the hook gave no usage or it is 0.
+fn content_tokens(cu: Option<&CurrentUsage>) -> Option<i64> {
     let cu = cu?;
-    if cap <= 0 {
-        return None;
-    }
     let cache_read = cu.cache_read_input_tokens.unwrap_or(0);
     let cache_creation = cu.cache_creation_input_tokens.unwrap_or(0);
     let input = cu.input_tokens.unwrap_or(0);
     let output = cu.output_tokens.unwrap_or(0);
     let content = cache_read + cache_creation + input + output;
-    if content <= 0 {
+    if content <= 0 { None } else { Some(content) }
+}
+
+/// Baseline-corrected context percent (matches /context more closely than raw used_percentage).
+fn computed_ctx_pct(cu: Option<&CurrentUsage>, cap: i64) -> Option<f64> {
+    if cap <= 0 {
         return None;
     }
-    let used = content + CONTEXT_BASELINE;
+    let used = content_tokens(cu)? + CONTEXT_BASELINE;
     Some((used as f64) * 100.0 / (cap as f64))
+}
+
+/// Signed token delta for the residue line: `+512`, `+3.1k`, `+84k`, `-120k`.
+fn fmt_delta(d: i64) -> String {
+    let a = d.abs();
+    if a < 1000 {
+        return format!("{:+}", d);
+    }
+    // Round to one decimal first so 9_950 and 10_049 both print as +10k.
+    let k = (d as f64 / 100.0).round() / 10.0;
+    if k.abs() < 10.0 {
+        format!("{k:+.1}k")
+    } else {
+        format!("{:+}k", k.round() as i64)
+    }
+}
+
+/// Per-turn context deltas from metrics rows, newest first, as (turn key,
+/// content tokens). The first row seen for a key is that turn's final state.
+/// Returns the last `n` deltas oldest first. When the session start is inside
+/// the window, the first turn's delta is measured from 0: the launch cost.
+fn turn_deltas(rows_newest_first: &[(String, i64)], n: usize) -> Vec<i64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut turns: Vec<i64> = Vec::with_capacity(n + 1);
+    let mut last_key: Option<&str> = None;
+    for (key, content) in rows_newest_first {
+        if last_key == Some(key.as_str()) {
+            continue;
+        }
+        last_key = Some(key.as_str());
+        turns.push(*content);
+        if turns.len() > n {
+            break;
+        }
+    }
+    turns.reverse();
+    let mut deltas = Vec::with_capacity(n);
+    let mut prev = if turns.len() > n { turns.remove(0) } else { 0 };
+    for t in turns {
+        deltas.push(t - prev);
+        prev = t;
+    }
+    deltas
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -701,6 +788,39 @@ fn main() {
         .and_then(|c| c.total_output_tokens)
         .unwrap_or(0);
 
+    // Metrics first, so the residue line can read the row this update wrote.
+    // Best-effort: any SQLite failure leaves the display untouched.
+    let content = content_tokens(cu_ref);
+    let branch = data
+        .workspace
+        .as_ref()
+        .and_then(|w| w.git_worktree.as_deref());
+    let residue: Vec<i64> = open_metrics_db()
+        .ok()
+        .map(|conn| {
+            let _ = log_metrics(
+                &conn,
+                project_dir,
+                branch,
+                data.model.as_ref().and_then(|m| m.display_name.as_deref()),
+                data.session_id.as_deref(),
+                data.prompt_id.as_deref(),
+                content,
+                in_tok,
+                out_tok,
+                cap,
+                raw_pct,
+                data.cost.as_ref().and_then(|c| c.total_cost_usd),
+                data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
+                data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
+            );
+            match (residue_turns(&cfg.residue), data.session_id.as_deref()) {
+                (n, Some(sid)) if n > 0 => residue_deltas(&conn, sid, n).unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        })
+        .unwrap_or_default();
+
     if cap > 0 {
         let current_tok = ((computed_pct / 100.0) * cap as f64) as i64;
         let pct_int = computed_pct.round() as i32;
@@ -741,6 +861,15 @@ fn main() {
         && usd > 0.001
     {
         let _ = write!(out, " {}|{} ${:.2}", c(&cfg, DIM), rst, usd);
+    }
+
+    // ── Residue line: what each of the last N turns added to the context ──
+    if !residue.is_empty() {
+        out.push_str("\nres:");
+        for d in &residue {
+            out.push(' ');
+            out.push_str(&fmt_delta(*d));
+        }
     }
 
     // ── Git line ──
@@ -831,47 +960,30 @@ fn main() {
     }
 
     print!("{out}");
-
-    // Log metrics to SQLite (best-effort, never block display)
-    let branch = data
-        .workspace
-        .as_ref()
-        .and_then(|w| w.git_worktree.as_deref());
-    let _ = log_metrics(
-        project_dir,
-        branch,
-        data.model.as_ref().and_then(|m| m.display_name.as_deref()),
-        in_tok,
-        out_tok,
-        cap,
-        raw_pct,
-        data.cost.as_ref().and_then(|c| c.total_cost_usd),
-        data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
-        data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
-    );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn log_metrics(
-    project: &str,
-    branch: Option<&str>,
-    model: Option<&str>,
-    in_tokens: i64,
-    out_tokens: i64,
-    context_cap: i64,
-    context_pct: f64,
-    cost_usd: Option<f64>,
-    five_hour: Option<&RateWindow>,
-    seven_day: Option<&RateWindow>,
-) -> Result<(), Box<dyn std::error::Error>> {
+// ─────────────────────────────────────────────────────────────────────
+// Metrics (SQLite)
+// ─────────────────────────────────────────────────────────────────────
+
+type DbResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+fn open_metrics_db() -> DbResult<Connection> {
     let home = std::env::var("HOME")?;
     let db_path = format!("{}/.config/dbg/statusline-metrics.db", home);
-
     let _ = std::fs::create_dir_all(format!("{}/.config/dbg", home));
-
     let conn = Connection::open(&db_path)?;
+    // Another status line (a second pane) may hold the write lock; wait a
+    // little, never long enough to be seen.
+    conn.busy_timeout(std::time::Duration::from_millis(50))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    ensure_schema(&conn)?;
+    Ok(conn)
+}
 
+/// Create the metrics table, and add the columns newer versions need to a
+/// table created by an older one.
+fn ensure_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metrics (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -890,34 +1002,79 @@ fn log_metrics(
             rate_7d_resets  INTEGER
         );",
     )?;
+    let mut have: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(metrics)")?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for n in names {
+            have.push(n?);
+        }
+    }
+    for (name, ty) in [
+        ("session_id", "TEXT"),
+        ("prompt_id", "TEXT"),
+        ("content", "INTEGER"),
+    ] {
+        if !have.iter().any(|h| h == name) {
+            conn.execute_batch(&format!("ALTER TABLE metrics ADD COLUMN {name} {ty};"))?;
+        }
+    }
+    // The residue query reads one session's rows newest first.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS metrics_session_id ON metrics(session_id, id);",
+    )?;
+    Ok(())
+}
 
-    let last: Option<(i64, i64, f64, f64)> = conn
+#[allow(clippy::too_many_arguments)]
+fn log_metrics(
+    conn: &Connection,
+    project: &str,
+    branch: Option<&str>,
+    model: Option<&str>,
+    session_id: Option<&str>,
+    prompt_id: Option<&str>,
+    content: Option<i64>,
+    in_tokens: i64,
+    out_tokens: i64,
+    context_cap: i64,
+    context_pct: f64,
+    cost_usd: Option<f64>,
+    five_hour: Option<&RateWindow>,
+    seven_day: Option<&RateWindow>,
+) -> DbResult<()> {
+    let last: Option<(i64, i64, f64, f64, i64)> = conn
         .query_row(
-            "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1) FROM metrics ORDER BY id DESC LIMIT 1",
+            "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1), COALESCE(content, -1) FROM metrics ORDER BY id DESC LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .ok();
 
     let cur_5h = five_hour.and_then(|w| w.used_percentage).unwrap_or(-1.0);
     let cur_7d = seven_day.and_then(|w| w.used_percentage).unwrap_or(-1.0);
+    let cur_content = content.unwrap_or(-1);
 
-    if let Some((last_in, last_out, last_5h, last_7d)) = last
+    if let Some((last_in, last_out, last_5h, last_7d, last_content)) = last
         && last_in == in_tokens
         && last_out == out_tokens
         && (last_5h - cur_5h).abs() < 0.01
         && (last_7d - cur_7d).abs() < 0.01
+        && last_content == cur_content
     {
         return Ok(());
     }
 
     conn.execute(
-        "INSERT INTO metrics (project, branch, model, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO metrics (project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             project,
             branch,
             model,
+            session_id,
+            prompt_id,
+            content,
             in_tokens,
             out_tokens,
             context_cap,
@@ -931,6 +1088,33 @@ fn log_metrics(
     )?;
 
     Ok(())
+}
+
+/// Context deltas of the last `n` user turns of `session_id`, oldest first.
+/// Rows without a prompt_id (older Claude Code) each count as a turn.
+fn residue_deltas(conn: &Connection, session_id: &str, n: usize) -> DbResult<Vec<i64>> {
+    // One row per turn: the last row of each prompt_id. Bounded by turns, so
+    // a turn with any number of API responses never pushes older turns out.
+    let limit = n as i64 + 1;
+    let mut stmt = conn.prepare(
+        "SELECT id, content FROM metrics
+         WHERE id IN (
+             SELECT MAX(id) FROM metrics
+             WHERE session_id = ?1 AND content IS NOT NULL
+             GROUP BY COALESCE(prompt_id, 'row-' || id)
+         )
+         ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id, limit], |row| {
+        let id: i64 = row.get(0)?;
+        let content: i64 = row.get(1)?;
+        Ok((id.to_string(), content))
+    })?;
+    let mut newest_first = Vec::new();
+    for r in rows {
+        newest_first.push(r?);
+    }
+    Ok(turn_deltas(&newest_first, n))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1064,6 +1248,218 @@ mod tests {
         assert!(!cfg.bar, "bar should be opt-in");
         assert!(!cfg.glyphs, "glyphs should be opt-in");
         assert!(cfg.color, "color should be on by default");
+        assert_eq!(
+            residue_turns(&cfg.residue),
+            0,
+            "residue line should be opt-in"
+        );
+    }
+
+    #[test]
+    fn residue_config_never_breaks_the_rest() {
+        // An out-of-range residue must not fail the whole config and drop bar.
+        let cfg: Config = serde_json::from_str(r#"{"bar": true, "residue": 300}"#).unwrap();
+        assert!(cfg.bar);
+        assert_eq!(residue_turns(&cfg.residue), 10);
+        let cfg: Config = serde_json::from_str(r#"{"glyphs": true, "residue": -1}"#).unwrap();
+        assert!(cfg.glyphs);
+        assert_eq!(residue_turns(&cfg.residue), 0);
+        // Not integers either: a float, a string, a huge number, junk, null.
+        for (raw, want) in [
+            (r#"{"bar": true, "residue": 2.5}"#, 2),
+            (r#"{"bar": true, "residue": "4"}"#, 4),
+            (r#"{"bar": true, "residue": 99999999999999999999}"#, 10),
+            (r#"{"bar": true, "residue": "x"}"#, 0),
+            (r#"{"bar": true, "residue": null}"#, 0),
+            (r#"{"bar": true, "residue": [6]}"#, 0),
+        ] {
+            let cfg: Config = serde_json::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert!(cfg.bar, "{raw}: bar must survive");
+            assert_eq!(residue_turns(&cfg.residue), want, "{raw}");
+        }
+        assert_eq!(clamp_residue(6), 6);
+        assert_eq!(clamp_residue(i64::MAX), 10);
+    }
+
+    #[test]
+    fn fmt_delta_shapes() {
+        assert_eq!(fmt_delta(0), "+0");
+        assert_eq!(fmt_delta(512), "+512");
+        assert_eq!(fmt_delta(-900), "-900");
+        assert_eq!(fmt_delta(3_140), "+3.1k");
+        assert_eq!(fmt_delta(9_940), "+9.9k");
+        assert_eq!(fmt_delta(9_999), "+10k", "one shape around 10k");
+        assert_eq!(fmt_delta(10_049), "+10k");
+        assert_eq!(fmt_delta(84_200), "+84k");
+        assert_eq!(fmt_delta(-120_400), "-120k");
+    }
+
+    fn rows(v: &[(&str, i64)]) -> Vec<(String, i64)> {
+        v.iter().map(|(k, c)| (k.to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn turn_deltas_groups_rows_by_prompt() {
+        // Newest first. Turn c had three API responses; its final state is 100_000.
+        let r = rows(&[
+            ("c", 100_000),
+            ("c", 97_000),
+            ("c", 90_000),
+            ("b", 88_000),
+            ("a", 84_000),
+        ]);
+        // Window wider than the session: first delta is the launch cost from 0.
+        assert_eq!(turn_deltas(&r, 6), vec![84_000, 4_000, 12_000]);
+        // Window of 2: oldest turn is the baseline, not shown.
+        assert_eq!(turn_deltas(&r, 2), vec![4_000, 12_000]);
+        assert_eq!(turn_deltas(&r, 1), vec![12_000]);
+        assert!(turn_deltas(&r, 0).is_empty());
+        assert!(turn_deltas(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn turn_deltas_show_compaction_as_negative() {
+        let r = rows(&[("c", 30_000), ("b", 150_000), ("a", 84_000)]);
+        assert_eq!(turn_deltas(&r, 10), vec![84_000, 66_000, -120_000]);
+    }
+
+    #[test]
+    fn schema_migrates_old_table_and_residue_reads_back() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A table as the previous release created it: no session, prompt or content.
+        conn.execute_batch(
+            "CREATE TABLE metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, project TEXT, branch TEXT,
+                model TEXT, in_tokens INTEGER, out_tokens INTEGER, context_cap INTEGER,
+                context_pct REAL, cost_usd REAL, rate_5h_pct REAL, rate_5h_resets INTEGER,
+                rate_7d_pct REAL, rate_7d_resets INTEGER);
+             INSERT INTO metrics (project, in_tokens, out_tokens) VALUES ('old', 1, 1);",
+        )
+        .unwrap();
+        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap(); // idempotent
+
+        let mut turn = 0;
+        let mut log = |prompt: &str, content: i64, in_t: i64| {
+            turn += 1;
+            log_metrics(
+                &conn,
+                "proj",
+                None,
+                Some("Fable"),
+                Some("s1"),
+                Some(prompt),
+                Some(content),
+                in_t,
+                turn,
+                200_000,
+                10.0,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        };
+        log("p1", 84_000, 84_000);
+        log("p2", 88_000, 172_000);
+        log("p3", 90_000, 262_000);
+        log("p3", 100_000, 362_000);
+        // Identical update: deduplicated, no new row.
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metrics", [], |r| r.get(0))
+            .unwrap();
+        log_metrics(
+            &conn,
+            "proj",
+            None,
+            Some("Fable"),
+            Some("s1"),
+            Some("p3"),
+            Some(100_000),
+            362_000,
+            turn,
+            200_000,
+            10.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metrics", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "unchanged update must not add a row");
+
+        assert_eq!(
+            residue_deltas(&conn, "s1", 10).unwrap(),
+            vec![84_000, 4_000, 12_000]
+        );
+        assert_eq!(residue_deltas(&conn, "s1", 2).unwrap(), vec![4_000, 12_000]);
+        assert!(residue_deltas(&conn, "other", 5).unwrap().is_empty());
+
+        // A turn with many API responses must not push older turns out of the
+        // window (review finding: the old row-based limit did).
+        for i in 1..=200_i64 {
+            log_metrics(
+                &conn,
+                "proj",
+                None,
+                Some("Fable"),
+                Some("s1"),
+                Some("p4"),
+                Some(100_000 + i * 10),
+                362_000 + i * 10,
+                1_000 + i,
+                200_000,
+                10.0,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(residue_deltas(&conn, "s1", 1).unwrap(), vec![2_000]);
+        assert_eq!(
+            residue_deltas(&conn, "s1", 4).unwrap(),
+            vec![84_000, 4_000, 12_000, 2_000]
+        );
+
+        // Rows without a prompt_id (older Claude Code) are one turn each.
+        log_metrics(
+            &conn,
+            "proj",
+            None,
+            None,
+            Some("s2"),
+            None,
+            Some(50_000),
+            1,
+            1,
+            200_000,
+            1.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        log_metrics(
+            &conn,
+            "proj",
+            None,
+            None,
+            Some("s2"),
+            None,
+            Some(53_000),
+            2,
+            2,
+            200_000,
+            1.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(residue_deltas(&conn, "s2", 5).unwrap(), vec![50_000, 3_000]);
     }
 
     #[test]
