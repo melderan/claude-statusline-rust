@@ -111,7 +111,11 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
     );
     assert_eq!(code, 0, "{err}");
     // One call row and one always_on row (0 characters: no CLAUDE.md in a scratch HOME).
-    assert!(out.contains("2 new row(s)"), "{out} {err}");
+    assert_eq!(
+        out.trim(),
+        format!("claude-statusline-rust --flush: 2 new row(s) in {recs}"),
+        "{err}"
+    );
     assert!(rec.exists());
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         &rec,

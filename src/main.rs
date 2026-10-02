@@ -1255,22 +1255,24 @@ fn main() {
 
 type DbResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-fn open_metrics_db(cfg: &Config, home: &str) -> DbResult<Connection> {
+/// Where the local metrics file is and whether it is opened as shared
+/// (dotfile lock, no WAL): the configured path, else the default under HOME.
+fn metrics_db_path(cfg: &Config, home: &str) -> DbResult<(String, bool)> {
     if home.is_empty() {
         return Err("HOME unset".into());
     }
-    match resolve_metrics_db(cfg.metrics_db.as_deref(), home) {
-        Some(path) => {
-            if let Some(parent) = std::path::Path::new(&path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            open_metrics_at(&path, true)
-        }
-        None => {
-            let _ = std::fs::create_dir_all(format!("{}/.config/dbg", home));
-            open_metrics_at(&format!("{home}/.config/dbg/statusline-metrics.db"), false)
-        }
+    Ok(match resolve_metrics_db(cfg.metrics_db.as_deref(), home) {
+        Some(path) => (path, true),
+        None => (format!("{home}/.config/dbg/statusline-metrics.db"), false),
+    })
+}
+
+fn open_metrics_db(cfg: &Config, home: &str) -> DbResult<Connection> {
+    let (path, shared) = metrics_db_path(cfg, home)?;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    open_metrics_at(&path, shared)
 }
 
 /// The shared metrics path from config: None for unset or blank; `~`, `~/x`
@@ -1323,6 +1325,22 @@ fn open_metrics_at(path: &str, shared: bool) -> DbResult<Connection> {
 /// Create the metrics table, and add the columns newer versions need to a
 /// table created by an older one.
 fn ensure_schema(conn: &Connection) -> DbResult<()> {
+    // One writer at a time reads the columns and adds the missing ones; two
+    // openers racing outside a transaction hit "duplicate column name".
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    match ensure_schema_inner(conn) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+fn ensure_schema_inner(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metrics (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1511,7 +1529,17 @@ fn flush_main() {
         return;
     };
     match run_flush(&cfg, &home, &recorder, &room) {
-        Ok(n) => println!("claude-statusline-rust --flush: {n} new row(s) in {recorder}"),
+        Ok(r) => {
+            println!(
+                "claude-statusline-rust --flush: {} new row(s) in {recorder}",
+                r.inserted
+            );
+            if r.left_behind {
+                eprintln!(
+                    "claude-statusline-rust --flush: batch cap reached, rows left for the next flush"
+                );
+            }
+        }
         Err(e) => eprintln!("claude-statusline-rust --flush: skipped: {e}"),
     }
 }
@@ -1528,16 +1556,20 @@ fn ctx<T>(r: DbResult<T>, what: &str) -> DbResult<T> {
     r.map_err(|e| -> Box<dyn std::error::Error> { format!("{what}: {e}").into() })
 }
 
-/// Columns of the recorder's `measures` table, in order; shared by the
-/// CREATE and the migration copy so the two cannot drift.
+/// Columns of the recorder's `measures` table written by the flush, in the
+/// order the INSERT binds them.
 const MEASURES_COLUMNS: &str =
     "ts, room, source, buffer, source_id, session_id, prompt_id, kind, key, value, unit, data";
 
+/// The recorder's idempotence key, in order. A recorder whose unique index
+/// is anything else is refused before a byte is written: with the old
+/// three-part key a rebuilt room's rows would be silently dropped again.
+const RECORDER_KEY: [&str; 4] = ["room", "source", "buffer", "source_id"];
+
 /// Open the recorder the house way: dotfile lock, rollback journal, a few
-/// seconds of patience, no lock removal. Creates the table and indexes. A
-/// table from before the `buffer` column is refused, not migrated: no such
-/// recorder exists in the house, and a migration racing a second flusher
-/// would relabel rows.
+/// seconds of patience, no lock removal. An existing `measures` table must
+/// carry a unique index on exactly RECORDER_KEY; a missing table is created
+/// from the house DDL. Nothing is written to a file that fails the check.
 fn open_recorder(path: &str) -> DbResult<Connection> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1545,6 +1577,14 @@ fn open_recorder(path: &str) -> DbResult<Connection> {
     let conn =
         Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), "unix-dotfile")?;
     conn.busy_timeout(RECORDER_BUSY_TIMEOUT)?;
+    let has_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'measures'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_table > 0 {
+        check_recorder_key(&conn)?;
+    }
     conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
     // The house recorder DDL, applied verbatim by every writer (house ADR 0015
     // point 5; the same text lives in the house's commons/schema/recorder.sql).
@@ -1568,23 +1608,50 @@ CREATE INDEX IF NOT EXISTS measures_room_ts        ON measures(room, ts);
 CREATE INDEX IF NOT EXISTS measures_kind_key_ts    ON measures(kind, key, ts);
 CREATE INDEX IF NOT EXISTS measures_session_prompt ON measures(session_id, prompt_id);";
     conn.execute_batch(create)?;
-    let has_buffer: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('measures') WHERE name = 'buffer'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_buffer == 0 {
-        return Err("measures table predates the buffer column; move the file aside".into());
-    }
     Ok(conn)
+}
+
+/// Refuse a `measures` table without a unique index on exactly RECORDER_KEY.
+fn check_recorder_key(conn: &Connection) -> DbResult<()> {
+    let mut uniques: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA index_list(measures)")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+        for row in rows {
+            let (name, unique) = row?;
+            if unique == 1 {
+                uniques.push(name);
+            }
+        }
+    }
+    for name in &uniques {
+        let quoted = name.replace('"', "\"\"");
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info(\"{quoted}\")"))?;
+        let mut cols: Vec<(i64, String)> = Vec::new();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?)))? {
+            cols.push(row?);
+        }
+        cols.sort();
+        let names: Vec<&str> = cols.iter().map(|(_, c)| c.as_str()).collect();
+        if names == RECORDER_KEY {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "measures table has no UNIQUE({}) index; this writer refuses it, move the file aside",
+        RECORDER_KEY.join(", ")
+    )
+    .into())
 }
 
 /// The local file's identity: a random id minted the first time the file is
 /// used for a flush and kept in it. A rebuilt room starts its local ids at 1
 /// again, so (room, source, source_id) alone would collide with the old
-/// life's rows; the buffer id tells the lives apart. A singleton row written
-/// with INSERT OR IGNORE inside BEGIN IMMEDIATE, so two first flushes at once
-/// (a doubled Stop hook) end with one id, not two copies of every row.
+/// life's rows; the buffer id tells the lives apart. The guarantee against two
+/// first flushes at once (a doubled Stop hook) minting two ids is the
+/// singleton primary key: INSERT OR IGNORE on `k = 1` lets exactly one
+/// candidate in, and every caller reads that one back. The transaction only
+/// keeps the insert and the read together.
 fn buffer_id(local: &Connection) -> DbResult<String> {
     local.execute_batch(
         "CREATE TABLE IF NOT EXISTS buffer_identity (
@@ -1757,9 +1824,22 @@ fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec<LocalRow>>
 /// always-on count differs from the previous local row, one scalar row
 /// (kind=always_on, key=chars, the file list as JSON) so the change is a
 /// plain series.
-fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbResult<usize> {
-    let local = ctx(open_metrics_db(cfg, home), "local metrics file")?;
-    let buffer = ctx(buffer_id(&local), "local metrics file")?;
+/// What a flush did: recorder rows inserted, and whether the batch cap left
+/// local rows for the next run.
+#[derive(Debug, Default, PartialEq)]
+struct FlushReport {
+    inserted: usize,
+    left_behind: bool,
+}
+
+fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbResult<FlushReport> {
+    let (local_path, _) = metrics_db_path(cfg, home)?;
+    let local_what = format!("local metrics file {local_path}");
+    let local = ctx(open_metrics_db(cfg, home), &local_what)?;
+    // The render waits 50 ms for the local file; the flush is not on a
+    // keystroke and can wait with the recorder's patience.
+    local.busy_timeout(RECORDER_BUSY_TIMEOUT)?;
+    let buffer = ctx(buffer_id(&local), &local_what)?;
     let recorder = ctx(
         open_recorder(recorder_path),
         &format!("recorder {recorder_path}"),
@@ -1769,21 +1849,28 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
     let target = std::fs::canonicalize(recorder_path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| recorder_path.to_string());
-    let mut inserted = 0usize;
-    for _ in 0..FLUSH_MAX_BATCHES {
-        let last = ctx(last_flushed_id(&local, &target), "local metrics file")?;
-        let rows = ctx(read_local_rows(&local, last), "local metrics file")?;
+    let mut report = FlushReport::default();
+    for batch in 0..=FLUSH_MAX_BATCHES {
+        let last = ctx(last_flushed_id(&local, &target), &local_what)?;
+        let rows = ctx(read_local_rows(&local, last), &local_what)?;
         if rows.is_empty() {
             break;
         }
-        // The always-on value of the row before this batch, for change detection.
-        let mut prev_on: Option<i64> = local
-            .query_row(
-                "SELECT always_on_chars FROM metrics WHERE id <= ?1 AND always_on_chars IS NOT NULL ORDER BY id DESC LIMIT 1",
-                [last],
-                |r| r.get(0),
-            )
-            .ok();
+        if batch == FLUSH_MAX_BATCHES {
+            report.left_behind = true;
+            break;
+        }
+        // The always-on value of the row before this batch, for change
+        // detection; no row is None, a read error is an error.
+        let mut prev_on: Option<i64> = match local.query_row(
+            "SELECT always_on_chars FROM metrics WHERE id <= ?1 AND always_on_chars IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [last],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(format!("{local_what}: {e}").into()),
+        };
         let tx = ctx(
             recorder.unchecked_transaction().map_err(Into::into),
             &format!("recorder {recorder_path}"),
@@ -1799,7 +1886,7 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
             )?;
             for r in &rows {
                 let ts = recorder_ts(&r.ts);
-                inserted += ctx(
+                report.inserted += ctx(
                     ins.execute(rusqlite::params![
                         ts,
                         room,
@@ -1820,7 +1907,7 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
                 if let Some(on) = r.always_on_chars
                     && prev_on != Some(on)
                 {
-                    inserted += ctx(
+                    report.inserted += ctx(
                         ins.execute(rusqlite::params![
                             ts,
                             room,
@@ -1847,15 +1934,12 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
             &format!("recorder {recorder_path}"),
         )?;
         let new_last = rows.last().map(|r| r.id).unwrap_or(last);
-        ctx(
-            advance_mark(&local, &target, new_last),
-            "local metrics file",
-        )?;
+        ctx(advance_mark(&local, &target, new_last), &local_what)?;
         if (rows.len() as i64) < FLUSH_BATCH {
             break;
         }
     }
-    Ok(inserted)
+    Ok(report)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2710,7 +2794,7 @@ mod tests {
             log_row(&local, "p3", 90_000, 3, &on(120));
         }
         // First flush: three call rows plus two always_on rows (100, then 120).
-        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 5);
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 5);
         let rec = open_recorder(&rp).unwrap();
         let count = |sql: &str| -> i64 { rec.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(
@@ -2753,7 +2837,7 @@ mod tests {
         assert!(files.contains("/a/CLAUDE.md"));
 
         // Second flush: nothing new.
-        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 0);
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 0);
         assert_eq!(count("SELECT COUNT(*) FROM measures"), 5);
 
         // A flush that lost its mark (killed before the update) inserts nothing twice.
@@ -2764,7 +2848,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            run_flush(&cfg, &h, &rp, "roomA").unwrap(),
+            run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted,
             0,
             "reported count is rows inserted"
         );
@@ -2775,7 +2859,7 @@ mod tests {
             let local = open_metrics_db(&cfg, &h).unwrap();
             log_row(&local, "p4", 95_000, 4, &on(120));
         }
-        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 1);
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 1);
         assert_eq!(count("SELECT COUNT(*) FROM measures"), 6);
         drop(rec);
 
@@ -2802,7 +2886,7 @@ mod tests {
             assert_eq!(last, 4, "mark unchanged by a skipped flush");
         }
         std::fs::remove_dir_all(&lock).unwrap();
-        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap(), 1);
+        assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 1);
         assert!(!dir.join("house").join("recorder.sqlite-wal").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2826,8 +2910,8 @@ mod tests {
         };
         let h1 = life("life1", &[("p1", 84_000), ("p2", 88_000), ("p3", 90_000)]);
         let h2 = life("life2", &[("q1", 50_000), ("q2", 52_000)]);
-        assert_eq!(run_flush(&cfg, &h1, &rp, "roomA").unwrap(), 4); // 3 calls + 1 always_on
-        assert_eq!(run_flush(&cfg, &h2, &rp, "roomA").unwrap(), 3); // 2 calls + 1 always_on
+        assert_eq!(run_flush(&cfg, &h1, &rp, "roomA").unwrap().inserted, 4); // 3 calls + 1 always_on
+        assert_eq!(run_flush(&cfg, &h2, &rp, "roomA").unwrap().inserted, 3); // 2 calls + 1 always_on
         let rec = open_recorder(&rp).unwrap();
         let calls: i64 = rec
             .query_row(
@@ -2871,16 +2955,16 @@ mod tests {
         );
         let ra = dir.join("a.sqlite").to_string_lossy().to_string();
         let rb = dir.join("b.sqlite").to_string_lossy().to_string();
-        assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap(), 3);
+        assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap().inserted, 3);
         assert_eq!(
-            run_flush(&cfg, &h, &rb, "roomA").unwrap(),
+            run_flush(&cfg, &h, &rb, "roomA").unwrap().inserted,
             3,
             "a second recorder has its own mark"
         );
-        assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap(), 0);
+        assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap().inserted, 0);
         // Two spellings of one recorder path share one mark.
         let ra2 = dir.join(".").join("a.sqlite").to_string_lossy().to_string();
-        assert_eq!(run_flush(&cfg, &h, &ra2, "roomA").unwrap(), 0);
+        assert_eq!(run_flush(&cfg, &h, &ra2, "roomA").unwrap().inserted, 0);
         let local = open_metrics_db(&cfg, &h).unwrap();
         let marks: i64 = local
             .query_row("SELECT COUNT(*) FROM flush_state", [], |r| r.get(0))
@@ -2939,6 +3023,83 @@ mod tests {
     }
 
     #[test]
+    fn recorder_refuses_the_wrong_unique_key_without_writing() {
+        let dir = fresh_dir("wrongkey");
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        {
+            let conn = Connection::open_with_flags_and_vfs(
+                &rp,
+                rusqlite::OpenFlags::default(),
+                "unix-dotfile",
+            )
+            .unwrap();
+            // The buffer column is there, the key is the old three-part one.
+            conn.execute_batch(
+                "CREATE TABLE measures (id INTEGER PRIMARY KEY, ts TEXT NOT NULL, room TEXT NOT NULL,
+                   source TEXT NOT NULL, buffer TEXT NOT NULL, source_id INTEGER NOT NULL, session_id TEXT,
+                   prompt_id TEXT, kind TEXT NOT NULL, key TEXT NOT NULL, value REAL, unit TEXT, data TEXT,
+                   UNIQUE(room, source, source_id));",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&rp).unwrap();
+        let err = open_recorder(&rp).unwrap_err().to_string();
+        assert!(
+            err.contains("UNIQUE(room, source, buffer, source_id)"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&rp).unwrap(),
+            before,
+            "a refused file is not modified"
+        );
+        // And a flush into it is refused by name, too.
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let cfg = Config::default();
+        {
+            let local = open_metrics_db(&cfg, &home.to_string_lossy()).unwrap();
+            log_row(&local, "p1", 84_000, 1, &on(100));
+        }
+        let err = run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("recorder ") && err.contains("UNIQUE"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_reports_rows_left_behind_by_the_batch_cap() {
+        let dir = fresh_dir("cap");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_string_lossy().to_string();
+        let cfg = Config::default();
+        let n = FLUSH_BATCH * FLUSH_MAX_BATCHES as i64 + 5;
+        {
+            let local = open_metrics_db(&cfg, &h).unwrap();
+            local.execute_batch("BEGIN").unwrap();
+            for i in 0..n {
+                log_row(&local, "p", 1_000 + i, i, &on(100));
+            }
+            local.execute_batch("COMMIT").unwrap();
+        }
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        let r = run_flush(&cfg, &h, &rp, "roomA").unwrap();
+        assert!(r.left_behind, "the cap must be reported, not silent");
+        assert_eq!(
+            r.inserted as i64,
+            FLUSH_BATCH * FLUSH_MAX_BATCHES as i64 + 1
+        );
+        let r = run_flush(&cfg, &h, &rp, "roomA").unwrap();
+        assert_eq!((r.inserted, r.left_behind), (5, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn buffer_id_is_minted_once_under_concurrent_first_flushes() {
         let dir = fresh_dir("mint");
         let path = dir.join("local.sqlite");
@@ -2989,7 +3150,7 @@ mod tests {
         }
         let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
         assert_eq!(
-            run_flush(&cfg, &h, &rp, "roomA").unwrap() as i64,
+            run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted as i64,
             n + 1,
             "every local row plus one always_on row, across two batches"
         );
