@@ -138,6 +138,19 @@ struct Config {
     /// ctx adds for the system prompt and tools.
     #[serde(default)]
     residue: serde_json::Value,
+    /// Where metrics go. Unset: `~/.config/dbg/statusline-metrics.db` with
+    /// WAL, as always. Set (or `CSR_METRICS_DB`): that file, opened with the
+    /// `unix-dotfile` VFS and a DELETE journal, so it may live on a network
+    /// or virtiofs mount that rejects SQLite's default locks. `~` and `~/`
+    /// expand; a relative path is taken from $HOME, never from the working
+    /// directory. The lock is a `<file>.lock` directory. A render that cannot
+    /// take it within the busy timeout skips its row and says so once on
+    /// stderr; it never removes a lock, because a lock that looks stale may
+    /// belong to a slow writer, and removing it corrupts the database. A lock
+    /// left by a killed process is cleared by whoever owns the file, when
+    /// nothing can be writing.
+    #[serde(default)]
+    metrics_db: Option<String>,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -173,6 +186,7 @@ impl Default for Config {
             glyphs: false,
             color: true,
             residue: serde_json::Value::from(0),
+            metrics_db: None,
         }
     }
 }
@@ -200,8 +214,24 @@ impl Config {
         if let Ok(v) = std::env::var("CSR_RESIDUE") {
             cfg.residue = serde_json::Value::from(v);
         }
+        cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);
         cfg
+    }
+
+    /// `CSR_METRICS_DB` overrides `metrics_db` from the file; a blank value is
+    /// "not set" and leaves the file's value alone.
+    fn apply_metrics_env(&mut self, env: Option<String>) {
+        if let Some(v) = env
+            && !v.trim().is_empty()
+        {
+            self.metrics_db = Some(v);
+        }
+        if let Some(p) = &self.metrics_db
+            && p.trim().is_empty()
+        {
+            self.metrics_db = None;
+        }
     }
 
     fn from_file() -> Option<Self> {
@@ -245,6 +275,18 @@ fn fmt_bytes(b: u64) -> String {
         } else {
             format!("{:.1}MB", b as f64 / (1024.0 * 1024.0))
         }
+    }
+}
+
+/// Characters, with an explicit unit so it is neither bytes nor tokens:
+/// `512ch`, `4.8kch`, `48kch`.
+fn fmt_chars(n: u64) -> String {
+    if n < 1000 {
+        format!("{n}ch")
+    } else if n < 10_000 {
+        format!("{:.1}kch", n as f64 / 1000.0)
+    } else {
+        format!("{}kch", (n as f64 / 1000.0).round() as u64)
     }
 }
 
@@ -565,6 +607,226 @@ fn memory_bytes_in(dir: &std::path::Path) -> (u64, u64) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Always-on text: what every turn carries before anyone speaks
+// ─────────────────────────────────────────────────────────────────────
+
+/// The files Claude Code loads into every turn of a session: the user
+/// CLAUDE.md, every CLAUDE.md / .claude/CLAUDE.md / CLAUDE.local.md from the
+/// project directory up to the root, their `@path` imports (depth-capped like
+/// Claude Code's own 5), and the memory index MEMORY.md. Characters, not
+/// tokens: roughly four characters to a token for English prose.
+#[derive(Debug, Default, PartialEq)]
+struct AlwaysOn {
+    chars: u64,
+    /// (path, chars), in load order, each file once.
+    files: Vec<(String, u64)>,
+}
+
+const IMPORT_MAX_DEPTH: usize = 5;
+
+fn always_on(project_dir: &str, home: &str) -> AlwaysOn {
+    let mut out = AlwaysOn::default();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if !home.is_empty() {
+        roots.push(
+            std::path::PathBuf::from(home)
+                .join(".claude")
+                .join("CLAUDE.md"),
+        );
+    }
+    if !project_dir.is_empty() {
+        // Root first, project last: the order Claude Code shows in /memory.
+        let mut dirs: Vec<std::path::PathBuf> = std::path::Path::new(project_dir)
+            .ancestors()
+            .map(|d| d.to_path_buf())
+            .collect();
+        dirs.reverse();
+        for d in dirs {
+            roots.push(d.join("CLAUDE.md"));
+            roots.push(d.join(".claude").join("CLAUDE.md"));
+            roots.push(d.join("CLAUDE.local.md"));
+        }
+        if !home.is_empty() {
+            roots.push(
+                std::path::PathBuf::from(home)
+                    .join(".claude")
+                    .join("projects")
+                    .join(path_to_memory_slug(project_dir))
+                    .join("memory")
+                    .join("MEMORY.md"),
+            );
+        }
+    }
+    for r in roots {
+        add_always_on_file(&r, home, 0, &mut seen, &mut out);
+    }
+    out
+}
+
+/// Largest file read for the always-on count; anything bigger is skipped so a
+/// stray import of a log or a dump cannot stall the render.
+const IMPORT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+fn add_always_on_file(
+    path: &std::path::Path,
+    home: &str,
+    depth: usize,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    out: &mut AlwaysOn,
+) {
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return;
+    };
+    // Regular files only: a FIFO or a device would hang every render.
+    match std::fs::metadata(&real) {
+        Ok(m) if m.is_file() && m.len() <= IMPORT_MAX_BYTES => {}
+        _ => return,
+    }
+    if !seen.insert(real) {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    // Count what the model sees; a stray invalid byte is one replacement char.
+    let text = String::from_utf8_lossy(&bytes);
+    let n = text.chars().count() as u64;
+    out.chars += n;
+    out.files.push((path.to_string_lossy().into_owned(), n));
+    if depth >= IMPORT_MAX_DEPTH {
+        return;
+    }
+    let base = path.parent().unwrap_or(std::path::Path::new("/"));
+    for imp in claude_md_imports(&text) {
+        let target = if let Some(rest) = imp.strip_prefix("~/") {
+            if home.is_empty() {
+                continue;
+            }
+            std::path::PathBuf::from(home).join(rest)
+        } else if imp.starts_with('/') {
+            std::path::PathBuf::from(&imp)
+        } else {
+            base.join(&imp)
+        };
+        add_always_on_file(&target, home, depth + 1, seen, out);
+    }
+}
+
+/// `@path` imports in a CLAUDE.md: an `@` at line start or after whitespace,
+/// then the path up to the next whitespace. A bare name (`@HOUSE.md`) is an
+/// import too; a name that is not a file is skipped at read time. Fenced
+/// code blocks and inline code are skipped, as Claude Code skips them.
+fn claude_md_imports(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    // An open fence: (fence char, run length). Closed by a run of the same
+    // char at least as long, alone on its line.
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        if let Some((fc, n)) = fence {
+            let run = t.chars().take_while(|&c| c == fc).count();
+            if run >= n && t[run..].trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        if indent <= 3 {
+            let fc = t.chars().next().unwrap_or(' ');
+            if fc == '`' || fc == '~' {
+                let run = t.chars().take_while(|&c| c == fc).count();
+                if run >= 3 {
+                    fence = Some((fc, run));
+                    continue;
+                }
+            }
+        }
+        // Indented code block: four spaces or a tab.
+        if line.starts_with("    ") || line.starts_with('\t') {
+            continue;
+        }
+        let plain = strip_code_spans(line);
+        // `@` counts at line start or after whitespace, so `me@example.com`
+        // is not an import. Byte offsets index `plain`, never a char count.
+        let mut at_token_start = true;
+        let mut rest = plain.as_str();
+        while let Some(i) = rest.find('@') {
+            let starts_token = if i == 0 {
+                at_token_start
+            } else {
+                rest[..i].ends_with(char::is_whitespace)
+            };
+            let after = &rest[i + 1..];
+            if !starts_token {
+                rest = after;
+                at_token_start = false;
+                continue;
+            }
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            let cand = after[..end].trim_end_matches([',', ';', ')', ']', '.', ':']);
+            if !cand.is_empty() {
+                found.push(cand.to_string());
+            }
+            rest = &after[end..];
+            at_token_start = false;
+        }
+    }
+    found
+}
+
+/// Replace inline code spans with a space, CommonMark style: a run of N
+/// backticks opens a span that the next run of exactly N closes; a run with
+/// no partner is literal text and hides nothing after it.
+fn strip_code_spans(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut n = 0;
+        while i + n < chars.len() && chars[i + n] == '`' {
+            n += 1;
+        }
+        // Find a closing run of exactly n.
+        let mut j = i + n;
+        let mut close: Option<usize> = None;
+        while j < chars.len() {
+            if chars[j] == '`' {
+                let mut m = 0;
+                while j + m < chars.len() && chars[j + m] == '`' {
+                    m += 1;
+                }
+                if m == n {
+                    close = Some(j);
+                    break;
+                }
+                j += m;
+            } else {
+                j += 1;
+            }
+        }
+        match close {
+            Some(c) => {
+                out.push(' ');
+                i = c + n;
+            }
+            None => {
+                for _ in 0..n {
+                    out.push('`');
+                }
+                i += n;
+            }
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Git info via gix (pure Rust)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -760,6 +1022,12 @@ fn main() {
             );
         }
     }
+    // Always-on characters: CLAUDE.md chain, imports and the memory index.
+    let on = always_on(project_dir, &home_dir().unwrap_or_default());
+
+    if on.chars > 0 {
+        let _ = write!(out, " {}|{} on:{}", c(&cfg, DIM), rst, fmt_chars(on.chars));
+    }
 
     // ── Line 2: ctx (bar if opted in), session tokens, cost ──
     let cap = data
@@ -795,10 +1063,19 @@ fn main() {
         .workspace
         .as_ref()
         .and_then(|w| w.git_worktree.as_deref());
-    let residue: Vec<i64> = open_metrics_db()
+    let home = home_dir().unwrap_or_default();
+    let opened = open_metrics_db(&cfg, &home);
+    if let Err(e) = &opened
+        && cfg.metrics_db.is_some()
+    {
+        // The shared file is locked or unreachable: this row is skipped,
+        // never forced. One line, so a Stop hook or a log shows it.
+        eprintln!("claude-statusline-rust: metrics skipped: {e}");
+    }
+    let residue: Vec<i64> = opened
         .ok()
         .map(|conn| {
-            let _ = log_metrics(
+            let logged = log_metrics(
                 &conn,
                 project_dir,
                 branch,
@@ -813,7 +1090,13 @@ fn main() {
                 data.cost.as_ref().and_then(|c| c.total_cost_usd),
                 data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
                 data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
+                Some(&on),
             );
+            if let Err(e) = logged
+                && cfg.metrics_db.is_some()
+            {
+                eprintln!("claude-statusline-rust: metrics row skipped: {e}");
+            }
             match (residue_turns(&cfg.residue), data.session_id.as_deref()) {
                 (n, Some(sid)) if n > 0 => residue_deltas(&conn, sid, n).unwrap_or_default(),
                 _ => Vec::new(),
@@ -968,15 +1251,67 @@ fn main() {
 
 type DbResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-fn open_metrics_db() -> DbResult<Connection> {
-    let home = std::env::var("HOME")?;
-    let db_path = format!("{}/.config/dbg/statusline-metrics.db", home);
-    let _ = std::fs::create_dir_all(format!("{}/.config/dbg", home));
-    let conn = Connection::open(&db_path)?;
-    // Another status line (a second pane) may hold the write lock; wait a
-    // little, never long enough to be seen.
-    conn.busy_timeout(std::time::Duration::from_millis(50))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+fn open_metrics_db(cfg: &Config, home: &str) -> DbResult<Connection> {
+    if home.is_empty() {
+        return Err("HOME unset".into());
+    }
+    match resolve_metrics_db(cfg.metrics_db.as_deref(), home) {
+        Some(path) => {
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            open_metrics_at(&path, true)
+        }
+        None => {
+            let _ = std::fs::create_dir_all(format!("{}/.config/dbg", home));
+            open_metrics_at(&format!("{home}/.config/dbg/statusline-metrics.db"), false)
+        }
+    }
+}
+
+/// The shared metrics path from config: None for unset or blank; `~`, `~/x`
+/// and a relative `x` all land under `home` (`~user` is a literal relative
+/// name, not another user's home); an absolute path is itself.
+fn resolve_metrics_db(raw: Option<&str>, home: &str) -> Option<String> {
+    let p = raw?.trim();
+    if p.is_empty() {
+        return None;
+    }
+    Some(if p == "~" {
+        home.to_string()
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("{home}/{p}")
+    })
+}
+
+/// `shared`: the file may sit on a mount that rejects fcntl locks (virtiofs,
+/// NFS), so lock with a dotfile and keep a rollback journal; WAL needs shared
+/// memory and cannot live there. Otherwise WAL on local disk, as before.
+/// Nothing here removes a lock: in the dotfile VFS every lock level is the
+/// same directory, so an old-looking lock can be a live writer or a slow
+/// reader, and deleting it under them corrupts the file.
+fn open_metrics_at(path: &str, shared: bool) -> DbResult<Connection> {
+    let conn = if shared {
+        Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), "unix-dotfile")?
+    } else {
+        Connection::open(path)?
+    };
+    // Another status line (a second pane) or a reader may hold the lock; wait
+    // a little, never long enough to be seen.
+    conn.busy_timeout(std::time::Duration::from_millis(if shared {
+        150
+    } else {
+        50
+    }))?;
+    if shared {
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
+    } else {
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    }
     ensure_schema(&conn)?;
     Ok(conn)
 }
@@ -1014,6 +1349,8 @@ fn ensure_schema(conn: &Connection) -> DbResult<()> {
         ("session_id", "TEXT"),
         ("prompt_id", "TEXT"),
         ("content", "INTEGER"),
+        ("always_on_chars", "INTEGER"),
+        ("always_on_files", "TEXT"),
     ] {
         if !have.iter().any(|h| h == name) {
             conn.execute_batch(&format!("ALTER TABLE metrics ADD COLUMN {name} {ty};"))?;
@@ -1042,32 +1379,45 @@ fn log_metrics(
     cost_usd: Option<f64>,
     five_hour: Option<&RateWindow>,
     seven_day: Option<&RateWindow>,
+    always_on: Option<&AlwaysOn>,
 ) -> DbResult<()> {
-    let last: Option<(i64, i64, f64, f64, i64)> = conn
+    let last: Option<(i64, i64, f64, f64, i64, i64)> = conn
         .query_row(
-            "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1), COALESCE(content, -1) FROM metrics ORDER BY id DESC LIMIT 1",
+            "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1), COALESCE(content, -1), COALESCE(always_on_chars, -1) FROM metrics ORDER BY id DESC LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .ok();
+    let cur_on: i64 = always_on.map(|a| a.chars as i64).unwrap_or(-1);
+    let on_files: Option<String> = always_on.and_then(|a| serde_json::to_string(&a.files).ok());
 
     let cur_5h = five_hour.and_then(|w| w.used_percentage).unwrap_or(-1.0);
     let cur_7d = seven_day.and_then(|w| w.used_percentage).unwrap_or(-1.0);
     let cur_content = content.unwrap_or(-1);
 
-    if let Some((last_in, last_out, last_5h, last_7d, last_content)) = last
+    if let Some((last_in, last_out, last_5h, last_7d, last_content, last_on)) = last
         && last_in == in_tokens
         && last_out == out_tokens
         && (last_5h - cur_5h).abs() < 0.01
         && (last_7d - cur_7d).abs() < 0.01
         && last_content == cur_content
+        && last_on == cur_on
     {
         return Ok(());
     }
 
     conn.execute(
-        "INSERT INTO metrics (project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO metrics (project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         rusqlite::params![
             project,
             branch,
@@ -1084,6 +1434,8 @@ fn log_metrics(
             five_hour.and_then(|w| w.resets_at),
             seven_day.and_then(|w| w.used_percentage),
             seven_day.and_then(|w| w.resets_at),
+            always_on.map(|a| a.chars as i64),
+            on_files,
         ],
     )?;
 
@@ -1338,6 +1690,22 @@ mod tests {
         .unwrap();
         ensure_schema(&conn).unwrap();
         ensure_schema(&conn).unwrap(); // idempotent
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(metrics)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for want in [
+            "session_id",
+            "prompt_id",
+            "content",
+            "always_on_chars",
+            "always_on_files",
+        ] {
+            assert!(cols.iter().any(|c| c == want), "missing column {want}");
+        }
 
         let mut turn = 0;
         let mut log = |prompt: &str, content: i64, in_t: i64| {
@@ -1354,6 +1722,7 @@ mod tests {
                 turn,
                 200_000,
                 10.0,
+                None,
                 None,
                 None,
                 None,
@@ -1380,6 +1749,7 @@ mod tests {
             turn,
             200_000,
             10.0,
+            None,
             None,
             None,
             None,
@@ -1415,6 +1785,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         }
@@ -1440,6 +1811,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         log_metrics(
@@ -1454,6 +1826,7 @@ mod tests {
             2,
             200_000,
             1.0,
+            None,
             None,
             None,
             None,
@@ -1512,6 +1885,397 @@ mod tests {
             let _ = std::fs::remove_dir_all(&outside);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_md_import_syntax() {
+        let text = "See @/abs/file.md and @~/home.md here\n@./rel.md\n  @../up.md,\nmail me@example.com or @handle\n```\n@/in/fence.md\n```\n@docs/guide.md.\n@HOUSE.md\n~~~\n@/in/tilde/fence.md\n~~~\nuse `@/in/code.md` not that\n@./é.md @./b.md\n``@/in/double.md``\n````\n```\n@/in/four.md\n````\n    @/indented.md\n`unmatched @./after.md\nsee `code @/in/span.md` here\n";
+        assert_eq!(
+            claude_md_imports(text),
+            vec![
+                "/abs/file.md",
+                "~/home.md",
+                "./rel.md",
+                "../up.md",
+                "handle",
+                "docs/guide.md",
+                "HOUSE.md",
+                "./é.md",
+                "./b.md",
+                "./after.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn code_span_stripping() {
+        assert_eq!(strip_code_spans("a `b` c"), "a   c");
+        assert_eq!(strip_code_spans("``x `y` z`` w"), "  w");
+        assert_eq!(strip_code_spans("`open @./x.md"), "`open @./x.md");
+        assert_eq!(strip_code_spans("no code"), "no code");
+    }
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "csr-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn always_on_counts_the_chain_once() {
+        let root = fresh_dir("on");
+        let home = root.join("home");
+        let proj = root.join("repos").join("app");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        let w = |p: &std::path::Path, text: &str| std::fs::write(p, text).unwrap();
+        // User file imports an absolute file; that file imports the user file back (a cycle).
+        let shared = root.join("shared.md");
+        w(
+            &home.join(".claude").join("CLAUDE.md"),
+            &format!("@{}\n", shared.display()),
+        );
+        w(&shared, "shared text\n@./home/.claude/CLAUDE.md\n");
+        assert!(
+            root.join("home").join(".claude").join("CLAUDE.md").exists(),
+            "cycle target exists"
+        );
+        // Parent-directory CLAUDE.md: relative import, bare import, fenced import, inline code.
+        w(
+            &root.join("repos").join("CLAUDE.md"),
+            "parent\n@./inc.md\n@HOUSE.md\n```\n@./ignored.md\n```\nsee `@./ignored.md`\n",
+        );
+        w(&root.join("repos").join("inc.md"), "12345");
+        w(&root.join("repos").join("HOUSE.md"), "house rules");
+        w(&root.join("repos").join("ignored.md"), "should not count");
+        // Project files; the local one has a non-ASCII name and invalid UTF-8 inside.
+        w(&proj.join("CLAUDE.md"), "project\n@./é.md @./b.md\n");
+        w(&proj.join("é.md"), "éé"); // 2 chars, 4 bytes
+        w(&proj.join("b.md"), "bb");
+        w(&proj.join(".claude").join("CLAUDE.md"), "dot");
+        std::fs::write(proj.join("CLAUDE.local.md"), b"loc\xffal").unwrap(); // 6 chars after lossy
+        // Memory index for this project.
+        let mem = home
+            .join(".claude")
+            .join("projects")
+            .join(path_to_memory_slug(&proj.to_string_lossy()))
+            .join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        w(&mem.join("MEMORY.md"), "memory index");
+        w(&mem.join("other.md"), "not always on");
+
+        let on = always_on(&proj.to_string_lossy(), &home.to_string_lossy());
+        let names: Vec<(String, u64)> = on
+            .files
+            .iter()
+            .map(|(p, n)| (p.rsplit('/').next().unwrap().to_string(), *n))
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        let user_len = format!("@{}\n", shared.display()).chars().count() as u64;
+        assert_eq!(
+            names,
+            vec![
+                ("CLAUDE.md".to_string(), user_len),
+                ("shared.md".to_string(), 38),
+                ("CLAUDE.md".to_string(), 69),
+                ("inc.md".to_string(), 5),
+                ("HOUSE.md".to_string(), 11),
+                ("CLAUDE.md".to_string(), 24),
+                ("é.md".to_string(), 2),
+                ("b.md".to_string(), 2),
+                ("CLAUDE.md".to_string(), 3),
+                ("CLAUDE.local.md".to_string(), 6),
+                ("MEMORY.md".to_string(), 12),
+            ]
+        );
+        assert_eq!(on.chars, names.iter().map(|(_, n)| n).sum::<u64>());
+        assert_eq!(always_on("", ""), AlwaysOn::default());
+    }
+
+    #[test]
+    fn always_on_import_depth_is_capped_at_five() {
+        let root = fresh_dir("depth");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // user CLAUDE.md (depth 0) -> c1 -> c2 -> c3 -> c4 -> c5 -> c6
+        std::fs::write(home.join(".claude").join("CLAUDE.md"), "@./c1.md").unwrap();
+        for i in 1..=6 {
+            std::fs::write(
+                home.join(".claude").join(format!("c{i}.md")),
+                format!("x @./c{}.md", i + 1),
+            )
+            .unwrap();
+        }
+        let on = always_on("", &home.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
+        let names: Vec<&str> = on
+            .files
+            .iter()
+            .map(|(p, _)| p.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["CLAUDE.md", "c1.md", "c2.md", "c3.md", "c4.md", "c5.md"]
+        );
+    }
+
+    #[test]
+    fn always_on_skips_an_oversized_import() {
+        let root = fresh_dir("big");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude").join("CLAUDE.md"),
+            "@./big.md\n@./ok.md",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".claude").join("big.md"),
+            vec![b'x'; IMPORT_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        std::fs::write(home.join(".claude").join("ok.md"), "ok").unwrap();
+        let on = always_on("", &home.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
+        let names: Vec<&str> = on
+            .files
+            .iter()
+            .map(|(p, _)| p.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["CLAUDE.md", "ok.md"],
+            "a file past the size cap is skipped"
+        );
+        assert_eq!(on.chars, 18 + 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn always_on_skips_a_fifo_import() {
+        let root = fresh_dir("fifo");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let fifo = home.join(".claude").join("pipe.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(made, "mkfifo available");
+        std::fs::write(
+            home.join(".claude").join("CLAUDE.md"),
+            "@./pipe.md\n@./ok.md",
+        )
+        .unwrap();
+        std::fs::write(home.join(".claude").join("ok.md"), "ok").unwrap();
+        // Without the regular-file check the read blocks forever; fail on a
+        // deadline instead of hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = home.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(always_on("", &h));
+        });
+        let on = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("always_on hung on a FIFO import");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(on.files.len(), 2);
+        assert_eq!(on.chars, 19 + 2);
+    }
+
+    #[test]
+    fn metrics_db_env_override() {
+        let mut cfg = Config::default();
+        cfg.metrics_db = Some("/from/file.sqlite".into());
+        cfg.apply_metrics_env(Some("   ".into()));
+        assert_eq!(
+            cfg.metrics_db.as_deref(),
+            Some("/from/file.sqlite"),
+            "blank env is not set"
+        );
+        cfg.apply_metrics_env(None);
+        assert_eq!(cfg.metrics_db.as_deref(), Some("/from/file.sqlite"));
+        cfg.apply_metrics_env(Some("/from/env.sqlite".into()));
+        assert_eq!(cfg.metrics_db.as_deref(), Some("/from/env.sqlite"));
+        let mut blank = Config::default();
+        blank.metrics_db = Some("".into());
+        blank.apply_metrics_env(None);
+        assert_eq!(blank.metrics_db, None, "blank in the file means unset");
+    }
+
+    #[test]
+    fn metrics_db_path_resolution() {
+        assert_eq!(resolve_metrics_db(None, "/h"), None);
+        assert_eq!(resolve_metrics_db(Some(""), "/h"), None);
+        assert_eq!(resolve_metrics_db(Some("  "), "/h"), None);
+        assert_eq!(
+            resolve_metrics_db(Some("~/a/b.sqlite"), "/h").as_deref(),
+            Some("/h/a/b.sqlite")
+        );
+        assert_eq!(resolve_metrics_db(Some("~"), "/h").as_deref(), Some("/h"));
+        assert_eq!(
+            resolve_metrics_db(Some("~bob/x.sqlite"), "/h").as_deref(),
+            Some("/h/~bob/x.sqlite"),
+            "~user is a literal relative name"
+        );
+        assert_eq!(
+            resolve_metrics_db(Some("rel.sqlite"), "/h").as_deref(),
+            Some("/h/rel.sqlite")
+        );
+        assert_eq!(
+            resolve_metrics_db(Some("/abs/x.sqlite"), "/h").as_deref(),
+            Some("/abs/x.sqlite")
+        );
+    }
+
+    #[test]
+    fn open_metrics_db_creates_the_parent_directory() {
+        let dir = fresh_dir("home");
+        let mut cfg = Config::default();
+        cfg.metrics_db = Some("state/deep/metrics.sqlite".into());
+        let conn = open_metrics_db(&cfg, &dir.to_string_lossy()).unwrap();
+        drop(conn);
+        assert!(
+            dir.join("state")
+                .join("deep")
+                .join("metrics.sqlite")
+                .is_file()
+        );
+        assert!(open_metrics_db(&cfg, "").is_err(), "no HOME, no metrics");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_metrics_db_locks_with_a_dotfile_and_never_removes_one() {
+        let dir = fresh_dir("db");
+        let path = dir.join("room.sqlite");
+        let p = path.to_string_lossy().to_string();
+        let lock = format!("{p}.lock");
+        let on = AlwaysOn {
+            chars: 48_000,
+            files: vec![("/x/CLAUDE.md".to_string(), 48_000)],
+        };
+        let on2 = AlwaysOn {
+            chars: 50_000,
+            files: vec![("/x/CLAUDE.md".to_string(), 50_000)],
+        };
+        let log = |conn: &Connection, a: &AlwaysOn| {
+            log_metrics(
+                conn,
+                "proj",
+                None,
+                None,
+                Some("s"),
+                Some("p"),
+                Some(1000),
+                1,
+                1,
+                200_000,
+                1.0,
+                None,
+                None,
+                None,
+                Some(a),
+            )
+        };
+        let conn = open_metrics_at(&p, true).unwrap();
+        log(&conn, &on).unwrap();
+
+        // Someone else holds the dotfile lock (a slow writer, a reader, a
+        // killed process): our write fails, the lock stays, the file is intact.
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::File::open(&lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(
+            log(&conn, &on2).is_err(),
+            "a held lock means no row, not a removal"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "bounded by busy_timeout"
+        );
+        assert!(
+            std::path::Path::new(&lock).is_dir(),
+            "an hour-old lock is still not ours to remove"
+        );
+        assert!(
+            open_metrics_at(&p, true).is_err(),
+            "the schema check needs the lock, so a held lock fails the open"
+        );
+        assert!(
+            std::path::Path::new(&lock).is_dir(),
+            "and the failed open did not touch the lock either"
+        );
+        std::fs::remove_dir_all(&lock).unwrap();
+
+        // The dotfile VFS is in use: the lock appears during a write transaction and goes after.
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO metrics (project) VALUES ('x');")
+            .unwrap();
+        assert!(
+            std::path::Path::new(&lock).exists(),
+            "dotfile lock held inside the transaction"
+        );
+        conn.execute_batch("COMMIT;").unwrap();
+        assert!(
+            !std::path::Path::new(&lock).exists(),
+            "lock released at commit"
+        );
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        let ok: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ok, "ok");
+
+        // always_on columns round-trip, and a change in them alone writes a new row.
+        let count = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM metrics", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = count();
+        for a in [&on, &on, &on2] {
+            log(&conn, a).unwrap();
+        }
+        assert_eq!(
+            count(),
+            before + 2,
+            "same input is one row; a changed always-on is another"
+        );
+        let (chars, files): (i64, String) = conn
+            .query_row(
+                "SELECT always_on_chars, always_on_files FROM metrics ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(chars, 50_000);
+        assert!(files.contains("/x/CLAUDE.md"));
+        drop(conn);
+        assert!(
+            !dir.join("room.sqlite-wal").exists(),
+            "no WAL beside a shared database"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fmt_chars_unit() {
+        assert_eq!(fmt_chars(512), "512ch");
+        assert_eq!(fmt_chars(4_800), "4.8kch");
+        assert_eq!(fmt_chars(47_735), "48kch");
     }
 
     #[test]
