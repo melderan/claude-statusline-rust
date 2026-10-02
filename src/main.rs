@@ -427,9 +427,9 @@ const MEMORY_WALK_MAX_DEPTH: usize = 8;
 fn memory_bytes_in(dir: &std::path::Path) -> (u64, u64) {
     let mut index = 0u64;
     let mut other = 0u64;
-    // Symlinks are followed (the house memory directory is itself a link),
-    // so remember each directory's real path and visit it once: a link
-    // pointing back up the tree cannot loop or double-count.
+    // Symlinks are followed (the memory directory may itself be a link), so
+    // remember each real path, directory or file, and count it once: a link
+    // back up the tree cannot loop, and a file reached twice is one file.
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
     while let Some((path, depth)) = stack.pop() {
@@ -460,6 +460,11 @@ fn memory_bytes_in(dir: &std::path::Path) -> (u64, u64) {
                 continue;
             }
             if !name_str.ends_with(".md") {
+                continue;
+            }
+            if let Ok(real) = std::fs::canonicalize(entry.path())
+                && !seen.insert(real)
+            {
                 continue;
             }
             if depth == 0 && name_str == "MEMORY.md" {
@@ -1101,13 +1106,13 @@ mod tests {
             assert_eq!(idx, 100);
             assert_eq!(
                 other,
-                60 + 7 + 7,
-                "link.md and linked-dir/far.md, counted once each"
+                60 + 7,
+                "link.md and linked-dir/far.md are one file, counted once"
             );
             // The memory directory itself may be a symlink (the house layout).
             let link_to_root = outside.join("memory");
             symlink(&root, &link_to_root).unwrap();
-            assert_eq!(memory_bytes_in(&link_to_root), (100, 74));
+            assert_eq!(memory_bytes_in(&link_to_root), (100, 67));
             let _ = std::fs::remove_dir_all(&outside);
         }
         let _ = std::fs::remove_dir_all(&root);
