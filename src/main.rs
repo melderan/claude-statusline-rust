@@ -1543,25 +1543,27 @@ fn open_recorder(path: &str) -> DbResult<Connection> {
         Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), "unix-dotfile")?;
     conn.busy_timeout(RECORDER_BUSY_TIMEOUT)?;
     conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
+    // The house recorder DDL, applied verbatim by every writer (house ADR 0015
+    // point 5; the same text lives in the house's commons/schema/recorder.sql).
     let create = "CREATE TABLE IF NOT EXISTS measures (
-            id         INTEGER PRIMARY KEY,
-            ts         TEXT NOT NULL,
-            room       TEXT NOT NULL,
-            source     TEXT NOT NULL,
-            buffer     TEXT NOT NULL,
-            source_id  INTEGER NOT NULL,
-            session_id TEXT,
-            prompt_id  TEXT,
-            kind       TEXT NOT NULL,
-            key        TEXT NOT NULL,
-            value      REAL,
-            unit       TEXT,
-            data       TEXT,
-            UNIQUE(room, source, buffer, source_id)
-         );
-         CREATE INDEX IF NOT EXISTS measures_room_ts ON measures(room, ts);
-         CREATE INDEX IF NOT EXISTS measures_kind_key_ts ON measures(kind, key, ts);
-         CREATE INDEX IF NOT EXISTS measures_session_prompt ON measures(session_id, prompt_id);";
+    id         INTEGER PRIMARY KEY,
+    ts         TEXT    NOT NULL,
+    room       TEXT    NOT NULL,
+    source     TEXT    NOT NULL,
+    buffer     TEXT    NOT NULL,
+    source_id  INTEGER NOT NULL,
+    session_id TEXT,
+    prompt_id  TEXT,
+    kind       TEXT    NOT NULL,
+    key        TEXT    NOT NULL,
+    value      REAL,
+    unit       TEXT,
+    data       TEXT,
+    UNIQUE(room, source, buffer, source_id)
+);
+CREATE INDEX IF NOT EXISTS measures_room_ts        ON measures(room, ts);
+CREATE INDEX IF NOT EXISTS measures_kind_key_ts    ON measures(kind, key, ts);
+CREATE INDEX IF NOT EXISTS measures_session_prompt ON measures(session_id, prompt_id);";
     let has_table: bool = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='measures'",
         [],
@@ -1663,6 +1665,19 @@ fn last_flushed_id(local: &Connection, target: &str) -> DbResult<i64> {
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Record the high-water mark. Two flushes at once may finish out of order;
+/// the mark only moves forward. Returns the mark now stored.
+fn advance_mark(local: &Connection, target: &str, new_last: i64) -> DbResult<i64> {
+    ensure_flush_state(local)?;
+    local.execute(
+        "INSERT INTO flush_state (target, last_id, ts) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         ON CONFLICT(target) DO UPDATE SET
+           last_id = MAX(flush_state.last_id, excluded.last_id), ts = excluded.ts",
+        rusqlite::params![target, new_last],
+    )?;
+    last_flushed_id(local, target)
 }
 
 /// ISO 8601 UTC with milliseconds. Local rows from before the millisecond
@@ -1825,13 +1840,7 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
             &format!("recorder {recorder_path}"),
         )?;
         let new_last = rows.last().map(|r| r.id).unwrap_or(last);
-        // Two flushes at once may finish out of order; the mark only moves forward.
-        local.execute(
-            "INSERT INTO flush_state (target, last_id, ts) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-             ON CONFLICT(target) DO UPDATE SET
-               last_id = MAX(flush_state.last_id, excluded.last_id), ts = excluded.ts",
-            rusqlite::params![target, new_last],
-        )?;
+        advance_mark(&local, &target, new_last)?;
         if (rows.len() as i64) < FLUSH_BATCH {
             break;
         }
@@ -2862,6 +2871,36 @@ mod tests {
         // Two spellings of one recorder path share one mark.
         let ra2 = dir.join(".").join("a.sqlite").to_string_lossy().to_string();
         assert_eq!(run_flush(&cfg, &h, &ra2, "roomA").unwrap(), 0);
+        let local = open_metrics_db(&cfg, &h).unwrap();
+        let marks: i64 = local
+            .query_row("SELECT COUNT(*) FROM flush_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marks, 2, "one mark per recorder file, not per spelling");
+
+        // The mark only moves forward, and a mark that cannot be read is an error.
+        assert_eq!(advance_mark(&local, "/t", 5).unwrap(), 5);
+        assert_eq!(
+            advance_mark(&local, "/t", 3).unwrap(),
+            5,
+            "a late flush cannot move it back"
+        );
+        assert_eq!(advance_mark(&local, "/t", 9).unwrap(), 9);
+        let broken = Connection::open_in_memory().unwrap();
+        broken
+            .execute_batch(
+                "CREATE TABLE flush_state (target TEXT PRIMARY KEY, last_id TEXT NOT NULL, ts TEXT NOT NULL);
+                 INSERT INTO flush_state VALUES ('/t', 'bogus', 'x');",
+            )
+            .unwrap();
+        assert!(
+            last_flushed_id(&broken, "/t").is_err(),
+            "a bad mark is not flush-everything-again"
+        );
+        assert_eq!(
+            last_flushed_id(&broken, "/other").unwrap(),
+            0,
+            "no mark is 0"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

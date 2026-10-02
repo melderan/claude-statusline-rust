@@ -115,5 +115,23 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
         "{out} {err}"
     );
     assert!(rec.exists());
+    let conn = rusqlite::Connection::open_with_flags_and_vfs(
+        &rec,
+        rusqlite::OpenFlags::default(),
+        "unix-dotfile",
+    )
+    .unwrap();
+    let rooms: Vec<String> = conn
+        .prepare("SELECT DISTINCT room FROM measures")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rooms,
+        vec!["sbx--x--room"],
+        "blank CSR_ROOM falls back to the full sandbox name"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
