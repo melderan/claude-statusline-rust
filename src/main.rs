@@ -192,15 +192,17 @@ fn fmt_duration_ms(ms: i64) -> String {
     }
 }
 
+/// Bytes on disk. The unit always says "B" so it cannot be read as tokens:
+/// the ctx line one row below uses a bare "k" for thousands of tokens.
 fn fmt_bytes(b: u64) -> String {
     if b == 0 {
         "-".to_string()
     } else if b < 1024 {
         format!("{}B", b)
     } else if b < 1024 * 1024 {
-        format!("{:.1}k", b as f64 / 1024.0)
+        format!("{:.0}KB", b as f64 / 1024.0)
     } else {
-        format!("{:.1}M", b as f64 / (1024.0 * 1024.0))
+        format!("{:.1}MB", b as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -401,30 +403,55 @@ fn path_to_memory_slug(abs_path: &str) -> String {
 }
 
 /// Returns (MEMORY.md bytes, other-memory-files bytes).
+///
+/// Only the top-level MEMORY.md is loaded at session start; every other
+/// `.md` under the memory directory, at any depth, is reachable by recall,
+/// so the second number walks subdirectories too.
 fn memory_bytes(project_dir: &str) -> (u64, u64) {
     let home = match home_dir() {
         Some(h) => h,
         None => return (0, 0),
     };
     let slug = path_to_memory_slug(project_dir);
-    let dir = format!("{}/.claude/projects/{}/memory", home, slug);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return (0, 0),
-    };
+    let dir = std::path::PathBuf::from(format!("{}/.claude/projects/{}/memory", home, slug));
+    memory_bytes_in(&dir)
+}
+
+/// Depth limit for the memory walk; a loop of symlinked directories cannot
+/// run away, and no sane memory tree is this deep.
+const MEMORY_WALK_MAX_DEPTH: usize = 8;
+
+fn memory_bytes_in(dir: &std::path::Path) -> (u64, u64) {
     let mut index = 0u64;
     let mut other = 0u64;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".md") {
-            continue;
-        }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if name_str == "MEMORY.md" {
-            index += size;
-        } else {
-            other += size;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
+    while let Some((path, depth)) = stack.pop() {
+        let entries = match std::fs::read_dir(&path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // metadata() follows symlinks, so a linked file or directory counts.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                if depth < MEMORY_WALK_MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if !name_str.ends_with(".md") {
+                continue;
+            }
+            if depth == 0 && name_str == "MEMORY.md" {
+                index += meta.len();
+            } else {
+                other += meta.len();
+            }
         }
     }
     (index, other)
@@ -915,8 +942,14 @@ mod tests {
     fn bytes_formatting() {
         assert_eq!(fmt_bytes(0), "-");
         assert_eq!(fmt_bytes(512), "512B");
-        assert_eq!(fmt_bytes(1536), "1.5k");
-        assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0M");
+        assert_eq!(fmt_bytes(1536), "2KB");
+        assert_eq!(
+            fmt_bytes(25_363),
+            "25KB",
+            "MEMORY.md-sized index reads as KB, not tokens"
+        );
+        assert_eq!(fmt_bytes(371_005), "362KB");
+        assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0MB");
     }
 
     #[test]
@@ -1010,6 +1043,31 @@ mod tests {
         assert!(!cfg.bar, "bar should be opt-in");
         assert!(!cfg.glyphs, "glyphs should be opt-in");
         assert!(cfg.color, "color should be on by default");
+    }
+
+    #[test]
+    fn memory_bytes_walks_subdirectories() {
+        let root = std::env::temp_dir().join(format!(
+            "csr-mem-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let rooms = root.join("rooms").join("tts");
+        std::fs::create_dir_all(&rooms).unwrap();
+        std::fs::write(root.join("MEMORY.md"), vec![b'x'; 100]).unwrap();
+        std::fs::write(root.join("a.md"), vec![b'x'; 10]).unwrap();
+        std::fs::write(root.join("notes.txt"), vec![b'x'; 1000]).unwrap();
+        std::fs::write(rooms.join("b.md"), vec![b'x'; 20]).unwrap();
+        // A nested MEMORY.md is an ordinary file, not the index.
+        std::fs::write(rooms.join("MEMORY.md"), vec![b'x'; 30]).unwrap();
+        let (idx, other) = memory_bytes_in(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(idx, 100);
+        assert_eq!(other, 60, "a.md + rooms/tts/b.md + rooms/tts/MEMORY.md");
+        assert_eq!(memory_bytes_in(&root.join("missing")), (0, 0));
     }
 
     #[test]
