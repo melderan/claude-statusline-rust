@@ -121,7 +121,7 @@ fn detect_width() -> usize {
 // on numeric values only (percentages, ages). Config file lives at
 // ~/.config/claude-statusline-rust/config.json; env vars override.
 
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Deserialize, Debug, Clone)]
 struct Config {
     #[serde(default)]
     bar: bool,
@@ -130,13 +130,14 @@ struct Config {
     #[serde(default = "default_true")]
     color: bool,
     /// Residue line: how many recent user turns to show with their context
-    /// cost (`res: +84k +3.1k ...`). 0 (the default) hides the line. Any
-    /// integer is accepted and clamped in code to 0..=RESIDUE_MAX, so a bad
-    /// value here never fails the whole config and drops the other settings.
+    /// cost (`res: +84k +3.1k ...`). 0 (the default) hides the line. Any JSON
+    /// value is accepted here, a number or a numeric string, and clamped in
+    /// code to 0..=RESIDUE_MAX by residue_turns(); anything else means 0. A
+    /// bad value never fails the whole config and drops the other settings.
     /// The numbers sum to less than the ctx figure by the fixed baseline that
     /// ctx adds for the system prompt and tools.
     #[serde(default)]
-    residue: i64,
+    residue: serde_json::Value,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -144,6 +145,21 @@ const RESIDUE_MAX: i64 = 10;
 
 fn clamp_residue(n: i64) -> usize {
     n.clamp(0, RESIDUE_MAX) as usize
+}
+
+/// Turns in the residue window from any JSON value: 6, 6.0, "6", 300 (10),
+/// -1 (0), 1e30 (10), "x" (0), null (0).
+fn residue_turns(v: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    let n: Option<f64> = match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    match n {
+        Some(f) if f.is_finite() => clamp_residue(f.clamp(0.0, RESIDUE_MAX as f64) as i64),
+        _ => 0,
+    }
 }
 
 fn default_true() -> bool {
@@ -156,7 +172,7 @@ impl Default for Config {
             bar: false,
             glyphs: false,
             color: true,
-            residue: 0,
+            residue: serde_json::Value::from(0),
         }
     }
 }
@@ -181,12 +197,10 @@ impl Config {
         if let Ok(v) = std::env::var("CSR_COLOR") {
             cfg.color = truthy(&v);
         }
-        if let Ok(v) = std::env::var("CSR_RESIDUE")
-            && let Ok(n) = v.trim().parse::<i64>()
-        {
-            cfg.residue = n;
+        if let Ok(v) = std::env::var("CSR_RESIDUE") {
+            cfg.residue = serde_json::Value::from(v);
         }
-        cfg.residue = clamp_residue(cfg.residue) as i64;
+        cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);
         cfg
     }
 
@@ -753,7 +767,7 @@ fn main() {
                 data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
                 data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
             );
-            match (clamp_residue(cfg.residue), data.session_id.as_deref()) {
+            match (residue_turns(&cfg.residue), data.session_id.as_deref()) {
                 (n, Some(sid)) if n > 0 => residue_deltas(&conn, sid, n).unwrap_or_default(),
                 _ => Vec::new(),
             }
@@ -1180,7 +1194,11 @@ mod tests {
         assert!(!cfg.bar, "bar should be opt-in");
         assert!(!cfg.glyphs, "glyphs should be opt-in");
         assert!(cfg.color, "color should be on by default");
-        assert_eq!(cfg.residue, 0, "residue line should be opt-in");
+        assert_eq!(
+            residue_turns(&cfg.residue),
+            0,
+            "residue line should be opt-in"
+        );
     }
 
     #[test]
@@ -1188,10 +1206,23 @@ mod tests {
         // An out-of-range residue must not fail the whole config and drop bar.
         let cfg: Config = serde_json::from_str(r#"{"bar": true, "residue": 300}"#).unwrap();
         assert!(cfg.bar);
-        assert_eq!(clamp_residue(cfg.residue), 10);
+        assert_eq!(residue_turns(&cfg.residue), 10);
         let cfg: Config = serde_json::from_str(r#"{"glyphs": true, "residue": -1}"#).unwrap();
         assert!(cfg.glyphs);
-        assert_eq!(clamp_residue(cfg.residue), 0);
+        assert_eq!(residue_turns(&cfg.residue), 0);
+        // Not integers either: a float, a string, a huge number, junk, null.
+        for (raw, want) in [
+            (r#"{"bar": true, "residue": 2.5}"#, 2),
+            (r#"{"bar": true, "residue": "4"}"#, 4),
+            (r#"{"bar": true, "residue": 99999999999999999999}"#, 10),
+            (r#"{"bar": true, "residue": "x"}"#, 0),
+            (r#"{"bar": true, "residue": null}"#, 0),
+            (r#"{"bar": true, "residue": [6]}"#, 0),
+        ] {
+            let cfg: Config = serde_json::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert!(cfg.bar, "{raw}: bar must survive");
+            assert_eq!(residue_turns(&cfg.residue), want, "{raw}");
+        }
         assert_eq!(clamp_residue(6), 6);
         assert_eq!(clamp_residue(i64::MAX), 10);
     }
