@@ -199,10 +199,13 @@ fn fmt_bytes(b: u64) -> String {
         "-".to_string()
     } else if b < 1024 {
         format!("{}B", b)
-    } else if b < 1024 * 1024 {
-        format!("{:.0}KB", b as f64 / 1024.0)
     } else {
-        format!("{:.1}MB", b as f64 / (1024.0 * 1024.0))
+        let kb = (b as f64 / 1024.0).round();
+        if kb < 1024.0 {
+            format!("{kb:.0}KB")
+        } else {
+            format!("{:.1}MB", b as f64 / (1024.0 * 1024.0))
+        }
     }
 }
 
@@ -417,15 +420,27 @@ fn memory_bytes(project_dir: &str) -> (u64, u64) {
     memory_bytes_in(&dir)
 }
 
-/// Depth limit for the memory walk; a loop of symlinked directories cannot
-/// run away, and no sane memory tree is this deep.
+/// Depth limit for the memory walk; no sane memory tree is this deep, and it
+/// bounds the work even if the visited set misses a loop.
 const MEMORY_WALK_MAX_DEPTH: usize = 8;
 
 fn memory_bytes_in(dir: &std::path::Path) -> (u64, u64) {
     let mut index = 0u64;
     let mut other = 0u64;
+    // Symlinks are followed (the house memory directory is itself a link),
+    // so remember each directory's real path and visit it once: a link
+    // pointing back up the tree cannot loop or double-count.
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
     while let Some((path, depth)) = stack.pop() {
+        match std::fs::canonicalize(&path) {
+            Ok(real) => {
+                if !seen.insert(real) {
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        }
         let entries = match std::fs::read_dir(&path) {
             Ok(e) => e,
             Err(_) => continue,
@@ -433,8 +448,8 @@ fn memory_bytes_in(dir: &std::path::Path) -> (u64, u64) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            // metadata() follows symlinks, so a linked file or directory counts.
-            let meta = match entry.metadata() {
+            // DirEntry::metadata does not follow a symlink; fs::metadata does.
+            let meta = match std::fs::metadata(entry.path()) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -949,6 +964,7 @@ mod tests {
             "MEMORY.md-sized index reads as KB, not tokens"
         );
         assert_eq!(fmt_bytes(371_005), "362KB");
+        assert_eq!(fmt_bytes(1_048_575), "1.0MB", "never 1024KB");
         assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0MB");
     }
 
@@ -1064,10 +1080,37 @@ mod tests {
         // A nested MEMORY.md is an ordinary file, not the index.
         std::fs::write(rooms.join("MEMORY.md"), vec![b'x'; 30]).unwrap();
         let (idx, other) = memory_bytes_in(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(idx, 100);
         assert_eq!(other, 60, "a.md + rooms/tts/b.md + rooms/tts/MEMORY.md");
         assert_eq!(memory_bytes_in(&root.join("missing")), (0, 0));
+
+        // Symlinks: a linked file counts, a linked directory is walked, and a
+        // link back to the root neither loops nor double-counts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = root
+                .join("..")
+                .join(format!("csr-mem-outside-{}", std::process::id()));
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("far.md"), vec![b'x'; 7]).unwrap();
+            symlink(outside.join("far.md"), root.join("link.md")).unwrap();
+            symlink(&outside, root.join("linked-dir")).unwrap();
+            symlink(&root, rooms.join("loop")).unwrap();
+            let (idx, other) = memory_bytes_in(&root);
+            assert_eq!(idx, 100);
+            assert_eq!(
+                other,
+                60 + 7 + 7,
+                "link.md and linked-dir/far.md, counted once each"
+            );
+            // The memory directory itself may be a symlink (the house layout).
+            let link_to_root = outside.join("memory");
+            symlink(&root, &link_to_root).unwrap();
+            assert_eq!(memory_bytes_in(&link_to_root), (100, 74));
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
