@@ -1267,12 +1267,23 @@ fn metrics_db_path(cfg: &Config, home: &str) -> DbResult<(String, bool)> {
     })
 }
 
+/// How long a render waits for the local file: a keystroke is behind it.
+const RENDER_PATIENCE: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn open_metrics_db(cfg: &Config, home: &str) -> DbResult<Connection> {
+    open_metrics_db_with(cfg, home, RENDER_PATIENCE)
+}
+
+fn open_metrics_db_with(
+    cfg: &Config,
+    home: &str,
+    patience: std::time::Duration,
+) -> DbResult<Connection> {
     let (path, shared) = metrics_db_path(cfg, home)?;
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    open_metrics_at(&path, shared)
+    open_metrics_at(&path, shared, patience)
 }
 
 /// The shared metrics path from config: None for unset or blank; `~`, `~/x`
@@ -1300,19 +1311,19 @@ fn resolve_metrics_db(raw: Option<&str>, home: &str) -> Option<String> {
 /// Nothing here removes a lock: in the dotfile VFS every lock level is the
 /// same directory, so an old-looking lock can be a live writer or a slow
 /// reader, and deleting it under them corrupts the file.
-fn open_metrics_at(path: &str, shared: bool) -> DbResult<Connection> {
+fn open_metrics_at(
+    path: &str,
+    shared: bool,
+    patience: std::time::Duration,
+) -> DbResult<Connection> {
     let conn = if shared {
         Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), "unix-dotfile")?
     } else {
         Connection::open(path)?
     };
-    // Another status line (a second pane) or a reader may hold the lock; wait
-    // a little, never long enough to be seen.
-    conn.busy_timeout(std::time::Duration::from_millis(if shared {
-        150
-    } else {
-        50
-    }))?;
+    // A render waits RENDER_PATIENCE (a shared file gets three times that);
+    // the flush passes its own, longer patience.
+    conn.busy_timeout(if shared { patience * 3 } else { patience })?;
     if shared {
         conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
     } else {
@@ -1325,8 +1336,12 @@ fn open_metrics_at(path: &str, shared: bool) -> DbResult<Connection> {
 /// Create the metrics table, and add the columns newer versions need to a
 /// table created by an older one.
 fn ensure_schema(conn: &Connection) -> DbResult<()> {
-    // One writer at a time reads the columns and adds the missing ones; two
-    // openers racing outside a transaction hit "duplicate column name".
+    // A complete schema costs one read and no write lock per render. Only
+    // when something is missing do we take BEGIN IMMEDIATE and re-check
+    // inside it, so two openers racing cannot hit "duplicate column name".
+    if schema_complete(conn)? {
+        return Ok(());
+    }
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     match ensure_schema_inner(conn) {
         Ok(()) => {
@@ -1338,6 +1353,28 @@ fn ensure_schema(conn: &Connection) -> DbResult<()> {
             Err(e)
         }
     }
+}
+
+const METRICS_ADDED_COLUMNS: [(&str, &str); 5] = [
+    ("session_id", "TEXT"),
+    ("prompt_id", "TEXT"),
+    ("content", "INTEGER"),
+    ("always_on_chars", "INTEGER"),
+    ("always_on_files", "TEXT"),
+];
+
+fn schema_complete(conn: &Connection) -> DbResult<bool> {
+    let cols: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('metrics') WHERE name IN ('session_id','prompt_id','content','always_on_chars','always_on_files')",
+        [],
+        |r| r.get(0),
+    )?;
+    let idx: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'metrics_session_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(cols == METRICS_ADDED_COLUMNS.len() as i64 && idx == 1)
 }
 
 fn ensure_schema_inner(conn: &Connection) -> DbResult<()> {
@@ -1367,13 +1404,7 @@ fn ensure_schema_inner(conn: &Connection) -> DbResult<()> {
             have.push(n?);
         }
     }
-    for (name, ty) in [
-        ("session_id", "TEXT"),
-        ("prompt_id", "TEXT"),
-        ("content", "INTEGER"),
-        ("always_on_chars", "INTEGER"),
-        ("always_on_files", "TEXT"),
-    ] {
+    for (name, ty) in METRICS_ADDED_COLUMNS {
         if !have.iter().any(|h| h == name) {
             conn.execute_batch(&format!("ALTER TABLE metrics ADD COLUMN {name} {ty};"))?;
         }
@@ -1534,9 +1565,10 @@ fn flush_main() {
                 "claude-statusline-rust --flush: {} new row(s) in {recorder}",
                 r.inserted
             );
-            if r.left_behind {
+            if r.left_behind > 0 {
                 eprintln!(
-                    "claude-statusline-rust --flush: batch cap reached, rows left for the next flush"
+                    "claude-statusline-rust --flush: batch cap reached, {} row(s) left for the next flush",
+                    r.left_behind
                 );
             }
         }
@@ -1577,11 +1609,15 @@ fn open_recorder(path: &str) -> DbResult<Connection> {
     let conn =
         Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), "unix-dotfile")?;
     conn.busy_timeout(RECORDER_BUSY_TIMEOUT)?;
-    let has_table: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'measures'",
-        [],
-        |r| r.get(0),
-    )?;
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'measures'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("{e} (a recorder left in WAL mode cannot be read through the dotfile VFS; run PRAGMA journal_mode=DELETE on it)").into()
+        })?;
     if has_table > 0 {
         check_recorder_key(&conn)?;
     }
@@ -1611,37 +1647,89 @@ CREATE INDEX IF NOT EXISTS measures_session_prompt ON measures(session_id, promp
     Ok(conn)
 }
 
-/// Refuse a `measures` table without a unique index on exactly RECORDER_KEY.
+/// Refuse a `measures` table unless it has a unique index on exactly
+/// RECORDER_KEY, in order, whole (no WHERE clause), with binary collation,
+/// and no other unique index that could make INSERT OR IGNORE drop a row the
+/// key would accept: a unique index that neither contains `id` nor covers
+/// all four key columns is narrower than the key, and SQLite cannot drop a
+/// table constraint, so a hand-migrated old recorder keeps its three-part
+/// autoindex beside the new one.
 fn check_recorder_key(conn: &Connection) -> DbResult<()> {
-    let mut uniques: Vec<String> = Vec::new();
+    let refuse = |why: &str| -> DbResult<()> {
+        Err(format!(
+            "measures table needs a whole, binary-collated UNIQUE({}) index and no narrower unique index; {why}; this writer refuses it, move the file aside",
+            RECORDER_KEY.join(", ")
+        )
+        .into())
+    };
+    // (name, partial) for every unique index, table constraint or named.
+    let mut uniques: Vec<(String, i64)> = Vec::new();
     {
         let mut stmt = conn.prepare("PRAGMA index_list(measures)")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
         for row in rows {
-            let (name, unique) = row?;
+            let (name, unique, partial) = row?;
             if unique == 1 {
-                uniques.push(name);
+                uniques.push((name, partial));
             }
         }
     }
-    for name in &uniques {
+    let mut key_found = false;
+    for (name, partial) in &uniques {
         let quoted = name.replace('"', "\"\"");
-        let mut stmt = conn.prepare(&format!("PRAGMA index_info(\"{quoted}\")"))?;
-        let mut cols: Vec<(i64, String)> = Vec::new();
-        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?)))? {
-            cols.push(row?);
+        // index_xinfo: seqno, cid, name (NULL for an expression), desc, coll, key.
+        let mut stmt = conn.prepare(&format!("PRAGMA index_xinfo(\"{quoted}\")"))?;
+        let mut cols: Vec<(i64, Option<String>, String)> = Vec::new();
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })? {
+            let (seq, col, coll, is_key) = row?;
+            if is_key == 1 {
+                cols.push((seq, col, coll));
+            }
         }
-        cols.sort();
-        let names: Vec<&str> = cols.iter().map(|(_, c)| c.as_str()).collect();
-        if names == RECORDER_KEY {
-            return Ok(());
+        cols.sort_by_key(|c| c.0);
+        let names: Vec<Option<&str>> = cols.iter().map(|(_, c, _)| c.as_deref()).collect();
+        let exact = names.len() == RECORDER_KEY.len()
+            && names
+                .iter()
+                .zip(RECORDER_KEY.iter())
+                .all(|(a, b)| *a == Some(*b));
+        if exact {
+            if *partial != 0 {
+                return refuse(&format!("index {name} is partial"));
+            }
+            if let Some((_, _, coll)) = cols
+                .iter()
+                .find(|(_, _, c)| !c.eq_ignore_ascii_case("BINARY"))
+            {
+                return refuse(&format!("index {name} uses collation {coll}"));
+            }
+            key_found = true;
+            continue;
+        }
+        let has_id = names.contains(&Some("id"));
+        let covers_key = RECORDER_KEY.iter().all(|k| names.contains(&Some(*k)));
+        if !has_id && !covers_key {
+            return refuse(&format!("unique index {name} is narrower than the key"));
         }
     }
-    Err(format!(
-        "measures table has no UNIQUE({}) index; this writer refuses it, move the file aside",
-        RECORDER_KEY.join(", ")
-    )
-    .into())
+    if key_found {
+        Ok(())
+    } else {
+        refuse("no such index")
+    }
 }
 
 /// The local file's identity: a random id minted the first time the file is
@@ -1829,16 +1917,19 @@ fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec<LocalRow>>
 #[derive(Debug, Default, PartialEq)]
 struct FlushReport {
     inserted: usize,
-    left_behind: bool,
+    /// Local rows past the batch cap, for the next flush.
+    left_behind: i64,
 }
 
 fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbResult<FlushReport> {
     let (local_path, _) = metrics_db_path(cfg, home)?;
     let local_what = format!("local metrics file {local_path}");
-    let local = ctx(open_metrics_db(cfg, home), &local_what)?;
     // The render waits 50 ms for the local file; the flush is not on a
-    // keystroke and can wait with the recorder's patience.
-    local.busy_timeout(RECORDER_BUSY_TIMEOUT)?;
+    // keystroke and opens with the recorder's patience.
+    let local = ctx(
+        open_metrics_db_with(cfg, home, RECORDER_BUSY_TIMEOUT),
+        &local_what,
+    )?;
     let buffer = ctx(buffer_id(&local), &local_what)?;
     let recorder = ctx(
         open_recorder(recorder_path),
@@ -1857,17 +1948,30 @@ fn run_flush(cfg: &Config, home: &str, recorder_path: &str, room: &str) -> DbRes
             break;
         }
         if batch == FLUSH_MAX_BATCHES {
-            report.left_behind = true;
+            report.left_behind = ctx(
+                local
+                    .query_row("SELECT COUNT(*) FROM metrics WHERE id > ?1", [last], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .map_err(Into::into),
+                &local_what,
+            )?;
             break;
         }
         // The always-on value of the row before this batch, for change
         // detection; no row is None, a read error is an error.
         let mut prev_on: Option<i64> = match local.query_row(
-            "SELECT always_on_chars FROM metrics WHERE id <= ?1 AND always_on_chars IS NOT NULL ORDER BY id DESC LIMIT 1",
+            "SELECT id, always_on_chars FROM metrics WHERE id <= ?1 AND always_on_chars IS NOT NULL ORDER BY id DESC LIMIT 1",
             [last],
-            |r| r.get::<_, i64>(0),
+            |r| {
+                let id: i64 = r.get(0)?;
+                Ok((id, r.get::<_, i64>(1)))
+            },
         ) {
-            Ok(v) => Some(v),
+            Ok((_, Ok(v))) => Some(v),
+            Ok((id, Err(e))) => {
+                return Err(format!("{local_what}: row {id}: always_on_chars: {e}").into());
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(e) => return Err(format!("{local_what}: {e}").into()),
         };
@@ -2665,7 +2769,7 @@ mod tests {
                 Some(a),
             )
         };
-        let conn = open_metrics_at(&p, true).unwrap();
+        let conn = open_metrics_at(&p, true, RENDER_PATIENCE).unwrap();
         log(&conn, &on).unwrap();
 
         // Someone else holds the dotfile lock (a slow writer, a reader, a
@@ -2689,7 +2793,7 @@ mod tests {
             "an hour-old lock is still not ours to remove"
         );
         assert!(
-            open_metrics_at(&p, true).is_err(),
+            open_metrics_at(&p, true, RENDER_PATIENCE).is_err(),
             "the schema check needs the lock, so a held lock fails the open"
         );
         assert!(
@@ -3089,13 +3193,13 @@ mod tests {
         }
         let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
         let r = run_flush(&cfg, &h, &rp, "roomA").unwrap();
-        assert!(r.left_behind, "the cap must be reported, not silent");
+        assert_eq!(r.left_behind, 5, "the cap must be reported with the count");
         assert_eq!(
             r.inserted as i64,
             FLUSH_BATCH * FLUSH_MAX_BATCHES as i64 + 1
         );
         let r = run_flush(&cfg, &h, &rp, "roomA").unwrap();
-        assert_eq!((r.inserted, r.left_behind), (5, false));
+        assert_eq!((r.inserted, r.left_behind), (5, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3124,8 +3228,115 @@ mod tests {
             log_row(&local, "p2", 88_000, 2, &on(100));
         }
         let err = run_flush(&cfg, &h, &rp, "roomA").unwrap_err().to_string();
-        assert!(err.starts_with("local metrics file "), "{err}");
+        assert!(
+            err.starts_with("local metrics file ") && err.contains("row 1"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a recorder file with the given DDL and say whether open_recorder takes it.
+    fn recorder_shape(tag: &str, ddl: &str) -> Result<(), String> {
+        let dir = fresh_dir(tag);
+        let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
+        {
+            let conn = Connection::open_with_flags_and_vfs(
+                &rp,
+                rusqlite::OpenFlags::default(),
+                "unix-dotfile",
+            )
+            .unwrap();
+            conn.execute_batch(ddl).unwrap();
+        }
+        let before = std::fs::read(&rp).unwrap();
+        let r = open_recorder(&rp).map(|_| ()).map_err(|e| e.to_string());
+        if r.is_err() {
+            assert_eq!(
+                std::fs::read(&rp).unwrap(),
+                before,
+                "{tag}: a refused file is not modified"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    const COLS: &str =
+        "id INTEGER PRIMARY KEY, ts TEXT NOT NULL, room TEXT NOT NULL, source TEXT NOT NULL,
+        buffer TEXT NOT NULL, source_id INTEGER NOT NULL, session_id TEXT, prompt_id TEXT,
+        kind TEXT NOT NULL, key TEXT NOT NULL, value REAL, unit TEXT, data TEXT";
+
+    #[test]
+    fn recorder_key_check_looks_at_every_unique_index() {
+        // The right key as a table constraint, or as a named unique index: accepted.
+        recorder_shape(
+            "k-ok",
+            &format!("CREATE TABLE measures ({COLS}, UNIQUE(room, source, buffer, source_id));"),
+        )
+        .unwrap();
+        recorder_shape(
+            "k-named",
+            &format!("CREATE TABLE measures ({COLS}); CREATE UNIQUE INDEX k ON measures(room, source, buffer, source_id);"),
+        )
+        .unwrap();
+        // A second unique index that contains id, or covers the key, is harmless.
+        recorder_shape(
+            "k-extra-id",
+            &format!("CREATE TABLE measures ({COLS}, UNIQUE(room, source, buffer, source_id), UNIQUE(id, ts));"),
+        )
+        .unwrap();
+        recorder_shape(
+            "k-superset",
+            &format!("CREATE TABLE measures ({COLS}, UNIQUE(room, source, buffer, source_id), UNIQUE(room, source, buffer, source_id, kind));"),
+        )
+        .unwrap();
+        // The hand-migrated old recorder: the right index beside the old three-part autoindex.
+        let e = recorder_shape(
+            "k-narrow-beside",
+            &format!("CREATE TABLE measures ({COLS}, UNIQUE(room, source, source_id)); CREATE UNIQUE INDEX k ON measures(room, source, buffer, source_id);"),
+        )
+        .unwrap_err();
+        assert!(e.contains("narrower"), "{e}");
+        // A partial index on the right columns dedupes nothing.
+        let e = recorder_shape(
+            "k-partial",
+            &format!("CREATE TABLE measures ({COLS}); CREATE UNIQUE INDEX k ON measures(room, source, buffer, source_id) WHERE kind = 'never';"),
+        )
+        .unwrap_err();
+        assert!(e.contains("partial"), "{e}");
+        // Wrong order, wrong width, wrong collation, an expression index, no index.
+        assert!(
+            recorder_shape(
+                "k-order",
+                &format!(
+                    "CREATE TABLE measures ({COLS}, UNIQUE(source, room, buffer, source_id));"
+                )
+            )
+            .is_err()
+        );
+        assert!(
+            recorder_shape(
+                "k-five",
+                &format!(
+                    "CREATE TABLE measures ({COLS}, UNIQUE(room, source, buffer, source_id, kind));"
+                )
+            )
+            .is_err()
+        );
+        let e = recorder_shape(
+            "k-nocase",
+            &format!("CREATE TABLE measures ({COLS}); CREATE UNIQUE INDEX k ON measures(room COLLATE NOCASE, source, buffer, source_id);"),
+        )
+        .unwrap_err();
+        assert!(e.contains("collation"), "{e}");
+        let e = recorder_shape(
+            "k-expr",
+            &format!("CREATE TABLE measures ({COLS}); CREATE UNIQUE INDEX k ON measures(lower(room), source, buffer, source_id);"),
+        )
+        .unwrap_err();
+        assert!(e.contains("UNIQUE(room, source, buffer, source_id)"), "{e}");
+        let e = recorder_shape("k-none", &format!("CREATE TABLE measures ({COLS});")).unwrap_err();
+        assert!(e.contains("no such index"), "{e}");
     }
 
     #[test]
