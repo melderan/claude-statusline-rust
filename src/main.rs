@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 
 mod config;
+mod extras;
 mod flush;
 mod git;
 mod input;
@@ -14,6 +15,7 @@ mod render;
 mod tests;
 
 use config::*;
+use extras::*;
 use flush::*;
 use git::*;
 use input::*;
@@ -213,10 +215,13 @@ fn main() {
             current_tok / 1000,
             cap / 1000
         );
+        if cfg.extras && data.exceeds_200k_tokens == Some(true) {
+            let _ = write!(out, " {}200k+{}", c(&cfg, AMBER), rst);
+        }
         if mode == Mode::Standard {
             let _ = write!(
                 out,
-                " {}|{} session in:{} out:{}",
+                " {}|{} last in:{} out:{}",
                 c(&cfg, DIM),
                 rst,
                 in_tok,
@@ -229,6 +234,12 @@ fn main() {
         && usd > 0.001
     {
         let _ = write!(out, " {}|{} ${:.2}", c(&cfg, DIM), rst, usd);
+    }
+    if cfg.cache
+        && let Some(pc) = data.prompt_cache.as_ref()
+        && let Some(seg) = cache_segment(pc, now_epoch(), &cfg)
+    {
+        let _ = write!(out, " {}|{} {}", c(&cfg, DIM), rst, seg);
     }
 
     // ── Residue line: what each of the last N turns added to the context ──
@@ -274,6 +285,11 @@ fn main() {
             };
             let _ = write!(out, " {}{}{}{}", c(&cfg, color), sym, g.behind, rst);
         }
+        if cfg.extras
+            && let Some(tag) = data.pr.as_ref().and_then(pr_tag)
+        {
+            let _ = write!(out, " {}|{} {}", c(&cfg, DIM), rst, tag);
+        }
     } else if let Some(br) = data
         .workspace
         .as_ref()
@@ -298,6 +314,12 @@ fn main() {
             .map(|ts| format!(", resets {}", fmt_reset(ts)))
             .unwrap_or_default();
         let _ = write!(out, "\n5h window: {:.0}% used{}{}", pct, icon, reset);
+        if cfg.extras
+            && let Some(ts) = five.resets_at
+            && let Some(p) = pace(pct, ts, FIVE_HOURS, now_epoch())
+        {
+            out.push_str(&fmt_pace(p, &cfg));
+        }
     }
 
     if let Some(seven) = data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()) {
@@ -308,14 +330,19 @@ fn main() {
                 .map(|ts| format!(", resets {}", fmt_reset(ts)))
                 .unwrap_or_default();
             let _ = write!(out, "\n7d window: {:.0}% used{}", pct, reset);
+            if cfg.extras
+                && let Some(ts) = seven.resets_at
+                && let Some(p) = pace(pct, ts, SEVEN_DAYS, now_epoch())
+            {
+                out.push_str(&fmt_pace(p, &cfg));
+            }
         }
     }
 
     // ── Misc line ──
     let mut misc: Vec<String> = Vec::new();
-    let sub_count = data.subagents.as_ref().and_then(|s| s.count).unwrap_or(0);
-    if sub_count > 0 {
-        misc.push(format!("agents:{}", sub_count));
+    if cfg.extras {
+        misc.extend(mode_tags(&data));
     }
     if let Some(mode) = data.vim.as_ref().and_then(|v| v.mode.as_deref()) {
         misc.push(format!("[{}]", mode));

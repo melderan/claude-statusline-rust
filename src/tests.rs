@@ -1459,3 +1459,215 @@ fn truthy_parsing() {
     assert!(!truthy("no"));
     assert!(!truthy(""));
 }
+
+// ── extras: prompt cache, pace, PR, mode tags ──
+
+fn plain() -> Config {
+    Config {
+        color: false,
+        ..Config::default()
+    }
+}
+
+#[test]
+fn cache_segment_warm_shows_hit_ttl_and_clock_expiry() {
+    let pc = PromptCache {
+        warm: Some(true),
+        caching_observed: Some(true),
+        ttl: Some("1h".into()),
+        expires_at: Some(1_791_242_565),
+        misses: Some(0),
+        hit_ratio: Some(0.979_871),
+        last_miss_cause: None,
+        recache_tokens_if_cold: Some(253_799),
+    };
+    let now = 1_791_242_565 - 42 * 60 - 10;
+    assert_eq!(
+        cache_segment(&pc, now, &plain()).as_deref(),
+        Some("cache 98% warm 1h, cold in 42m (23:22Z)")
+    );
+}
+
+#[test]
+fn cache_segment_cold_names_the_rewarm_cost_and_the_last_miss() {
+    let pc = PromptCache {
+        warm: Some(false),
+        caching_observed: Some(true),
+        ttl: None,
+        expires_at: None,
+        misses: Some(2),
+        hit_ratio: Some(0.71),
+        last_miss_cause: Some(serde_json::Value::from("system_prompt_changed")),
+        recache_tokens_if_cold: Some(253_799),
+    };
+    assert_eq!(
+        cache_segment(&pc, 0, &plain()).as_deref(),
+        Some("cache cold 71% (+253k to rewarm) miss:2 (system_prompt_changed)")
+    );
+}
+
+#[test]
+fn cache_segment_is_silent_until_caching_is_observed() {
+    let pc = PromptCache {
+        warm: Some(false),
+        caching_observed: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(cache_segment(&pc, 0, &plain()), None);
+    assert_eq!(cache_segment(&PromptCache::default(), 0, &plain()), None);
+}
+
+#[test]
+fn pace_is_used_over_elapsed_and_quiet_early_in_the_window() {
+    // half the 5 h window gone, 50% used: an even spend
+    let now = 1_000_000;
+    let resets = now + FIVE_HOURS / 2;
+    assert_eq!(pace(50.0, resets, FIVE_HOURS, now), Some(1.0));
+    // a quarter gone, 50% used: twice the even pace
+    let resets = now + FIVE_HOURS * 3 / 4;
+    assert_eq!(pace(50.0, resets, FIVE_HOURS, now), Some(2.0));
+    // first minute of the window: no number yet
+    let resets = now + FIVE_HOURS - 60;
+    assert_eq!(pace(1.0, resets, FIVE_HOURS, now), None);
+    // a reset already in the past counts as the whole window elapsed
+    assert_eq!(pace(80.0, now - 10, SEVEN_DAYS, now), Some(0.8));
+    assert_eq!(pace(80.0, now, 0, now), None);
+}
+
+#[test]
+fn pace_colours_by_threshold() {
+    let cfg = Config::default();
+    assert!(fmt_pace(0.9, &cfg).contains(GREEN));
+    assert!(fmt_pace(1.1, &cfg).contains(AMBER));
+    assert!(fmt_pace(1.3, &cfg).contains(ROSE));
+    assert_eq!(fmt_pace(1.25, &plain()), " pace 1.2x");
+}
+
+#[test]
+fn pr_tag_reads_github_and_gitlab_shapes() {
+    let pr = Pr {
+        number: Some(123),
+        review_state: Some("approved".into()),
+        kind: None,
+    };
+    assert_eq!(pr_tag(&pr).as_deref(), Some("PR#123 approved"));
+    let mr = Pr {
+        number: Some(45),
+        review_state: Some("draft".into()),
+        kind: Some("mr".into()),
+    };
+    assert_eq!(pr_tag(&mr).as_deref(), Some("MR!45 draft"));
+    assert_eq!(pr_tag(&Pr::default()), None);
+    let bare = Pr {
+        number: Some(7),
+        ..Default::default()
+    };
+    assert_eq!(pr_tag(&bare).as_deref(), Some("PR#7"));
+}
+
+#[test]
+fn mode_tags_show_effort_fast_thinking_off_name_and_worktree() {
+    let data: Input = serde_json::from_str(
+        r#"{"effort":{"level":"high"},"fast_mode":true,"thinking":{"enabled":false},
+            "session_name":"a very long session name that keeps on going past the limit",
+            "worktree":{"name":"feature-x","path":"/w/feature-x"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        mode_tags(&data),
+        vec![
+            "effort:high",
+            "fast",
+            "think:off",
+            "\"a very long session name that k\u{2026}\"",
+            "wt:feature-x"
+        ]
+    );
+    // defaults are silent: thinking on, fast off, no names
+    let quiet: Input =
+        serde_json::from_str(r#"{"thinking":{"enabled":true},"fast_mode":false}"#).unwrap();
+    assert!(mode_tags(&quiet).is_empty());
+}
+
+#[test]
+fn new_hook_fields_parse_from_a_real_shaped_payload() {
+    // trimmed from a real Claude Code 2.1.289 hook payload; values changed
+    let data: Input = serde_json::from_str(
+        r#"{"context_window":{"total_input_tokens":258285,"total_output_tokens":3,"context_window_size":1000000,
+            "used_percentage":26,"remaining_percentage":74},
+            "exceeds_200k_tokens":true,"fast_mode":false,"effort":{"level":"high"},"thinking":{"enabled":true},
+            "prompt_cache":{"warm":true,"caching_observed":true,"ttl":"1h","expires_at":1791242565,"requests":67,
+            "misses":0,"expected_rebuilds":0,"hit_ratio":0.9798,"cache_write_tokens":232037,"last_miss_at":null,
+            "last_miss_cause":null,"miss_causes":{},"recache_tokens_if_cold":253799},
+            "output_style":{"name":"default"},"rate_limits":null,"pr":null,"worktree":null}"#,
+    )
+    .unwrap();
+    assert_eq!(data.exceeds_200k_tokens, Some(true));
+    let pc = data.prompt_cache.as_ref().unwrap();
+    assert_eq!(pc.warm, Some(true));
+    assert_eq!(pc.recache_tokens_if_cold, Some(253_799));
+    assert!(data.pr.is_none() && data.worktree.is_none() && data.rate_limits.is_none());
+}
+
+#[test]
+fn time_helpers() {
+    assert_eq!(fmt_hm_utc(1_791_242_565), "23:22Z");
+    assert_eq!(fmt_in(0), "now");
+    assert_eq!(fmt_in(30), "in 1m");
+    assert_eq!(fmt_in(42 * 60), "in 42m");
+    assert_eq!(fmt_in(3600 + 5 * 60), "in 1h05m");
+    assert_eq!(fmt_in(2 * 86400 + 3 * 3600), "in 2d3h");
+    assert_eq!(truncate("short", 10), "short");
+    assert_eq!(truncate("exactly-ten", 11), "exactly-ten");
+    assert_eq!(truncate("abcdefgh", 4), "abc\u{2026}");
+}
+
+#[test]
+fn miss_cause_reads_the_string_and_the_object_shape() {
+    let obj: serde_json::Value = serde_json::from_str(r#"{"causes":["ttl_expired_1h"]}"#).unwrap();
+    assert_eq!(miss_cause_text(&obj).as_deref(), Some("ttl_expired_1h"));
+    let two: serde_json::Value = serde_json::from_str(r#"{"causes":["a","b"]}"#).unwrap();
+    assert_eq!(miss_cause_text(&two).as_deref(), Some("a+b"));
+    assert_eq!(
+        miss_cause_text(&serde_json::Value::from("plain")).as_deref(),
+        Some("plain")
+    );
+    assert_eq!(miss_cause_text(&serde_json::Value::from("")), None);
+    assert_eq!(miss_cause_text(&serde_json::Value::from(7)), None);
+    assert_eq!(miss_cause_text(&serde_json::json!({"causes": []})), None);
+}
+
+#[test]
+fn a_surprising_sub_object_shape_costs_one_segment_not_the_line() {
+    // the real 2026-10-06 payload shape for last_miss_cause: an object
+    let data: Input = serde_json::from_str(
+        r#"{"model":{"display_name":"Fable 5.1"},
+            "prompt_cache":{"warm":true,"caching_observed":true,"ttl":"1h","expires_at":1791249359,"misses":1,
+            "hit_ratio":0.969,"last_miss_cause":{"causes":["ttl_expired_1h"]},"recache_tokens_if_cold":351352}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        data.model.as_ref().unwrap().display_name.as_deref(),
+        Some("Fable 5.1")
+    );
+    let seg = cache_segment(
+        data.prompt_cache.as_ref().unwrap(),
+        1791249359 - 600,
+        &plain(),
+    )
+    .unwrap();
+    assert_eq!(
+        seg,
+        "cache 97% warm 1h, cold in 10m (01:15Z) miss:1 (ttl_expired_1h)"
+    );
+    // a shape nothing here expects: the cache segment is dropped, the model survives
+    let data: Input = serde_json::from_str(
+        r#"{"model":{"display_name":"Fable 5.1"},"prompt_cache":"nope","pr":[1,2],"effort":{"level":{"x":1}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        data.model.as_ref().unwrap().display_name.as_deref(),
+        Some("Fable 5.1")
+    );
+    assert!(data.prompt_cache.is_none() && data.pr.is_none() && data.effort.is_none());
+}

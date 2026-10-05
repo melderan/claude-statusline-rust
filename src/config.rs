@@ -37,6 +37,16 @@ pub(crate) struct Config {
     /// nothing can be writing.
     #[serde(default)]
     pub(crate) metrics_db: Option<String>,
+    /// Prompt cache segment on the ctx line (`cache 98% warm 1h, cold in 42m`).
+    /// On by default; `cache: false` or `CSR_CACHE=0` hides it.
+    #[serde(default = "default_true")]
+    pub(crate) cache: bool,
+    /// The newer hook fields as segments: pace on the rate-limit lines, the
+    /// 200k+ marker, PR state on the git line, effort, fast mode, session and
+    /// worktree names on the misc line. On by default; `extras: false` or
+    /// `CSR_EXTRAS=0` hides them all.
+    #[serde(default = "default_true")]
+    pub(crate) extras: bool,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -73,6 +83,8 @@ impl Default for Config {
             color: true,
             residue: serde_json::Value::from(0),
             metrics_db: None,
+            cache: true,
+            extras: true,
         }
     }
 }
@@ -99,6 +111,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CSR_RESIDUE") {
             cfg.residue = serde_json::Value::from(v);
+        }
+        if let Ok(v) = std::env::var("CSR_CACHE") {
+            cfg.cache = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("CSR_EXTRAS") {
+            cfg.extras = truthy(&v);
         }
         cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);

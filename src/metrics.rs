@@ -151,8 +151,8 @@ pub(crate) fn ensure_schema_inner(conn: &Connection) -> DbResult<()> {
             project         TEXT,
             branch          TEXT,
             model           TEXT,
-            in_tokens       INTEGER,
-            out_tokens      INTEGER,
+            in_tokens       INTEGER, -- context_window.total_input_tokens: the most recent API response, cache reads included
+            out_tokens      INTEGER, -- context_window.total_output_tokens: that response's output, not a session total
             context_cap     INTEGER,
             context_pct     REAL,
             cost_usd        REAL,
