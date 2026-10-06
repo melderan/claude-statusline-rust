@@ -13,6 +13,7 @@ mod metrics;
 mod render;
 #[cfg(test)]
 mod tests;
+mod voice;
 
 use config::*;
 use extras::*;
@@ -22,6 +23,7 @@ use input::*;
 use memory::*;
 use metrics::*;
 use render::*;
+use voice::*;
 
 fn main() {
     if std::env::args().skip(1).any(|a| a == "--flush") {
@@ -343,6 +345,16 @@ fn main() {
     let mut misc: Vec<String> = Vec::new();
     if cfg.extras {
         misc.extend(mode_tags(&data));
+    }
+    if cfg.voice
+        && let Some(session) = voice_session(
+            std::env::var("CLAUDE_TTS_SESSION").ok().as_deref(),
+            project_dir,
+        )
+        && let Some(card) = read_voice_card(&voice_card_path(&home, &session))
+        && let Some(seg) = voice_segment(&card)
+    {
+        misc.push(seg);
     }
     if let Some(mode) = data.vim.as_ref().and_then(|v| v.mode.as_deref()) {
         misc.push(format!("[{}]", mode));

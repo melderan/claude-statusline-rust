@@ -1671,3 +1671,66 @@ fn a_surprising_sub_object_shape_costs_one_segment_not_the_line() {
     );
     assert!(data.prompt_cache.is_none() && data.pr.is_none() && data.effort.is_none());
 }
+
+// ── voice card (claude-code-tts docs/voice-card.md, schema 1) ──
+
+const CARD: &str = r#"{"schema":1,"session":"-Users-me-code-app","persona":"claude-connery","backend":"mlx",
+  "voice":"mlx-community/Kokoro-82M-bf16:bm_george","speed":1.8,"muted":false,"intermediate":true,"mode":"queue",
+  "written_at":"2026-10-05T22:50:12Z","claude_tts":"9.48.0"}"#;
+
+#[test]
+fn voice_segment_reads_the_card_and_shortens_the_engine_voice() {
+    assert_eq!(
+        voice_segment(CARD).as_deref(),
+        Some("voice: claude-connery (bm_george) 1.8x")
+    );
+    let piper = r#"{"schema":1,"persona":"statusline-amy","backend":"piper","voice":"en_US-amy-medium","speed":2.0,"muted":true}"#;
+    assert_eq!(
+        voice_segment(piper).as_deref(),
+        Some("voice: statusline-amy (en_US-amy-medium) 2.0x muted")
+    );
+}
+
+#[test]
+fn voice_segment_shows_nothing_it_does_not_understand() {
+    assert_eq!(
+        voice_segment(r#"{"schema":2,"persona":"x","speed":1.0}"#),
+        None
+    );
+    assert_eq!(voice_segment(r#"{"persona":"x"}"#), None);
+    assert_eq!(voice_segment(r#"{"schema":1,"speed":1.0}"#), None);
+    assert_eq!(voice_segment("not json"), None);
+    assert_eq!(read_voice_card("/nonexistent/voice.d/none.json"), None);
+}
+
+#[test]
+fn voice_session_prefers_the_env_then_the_project_slug() {
+    assert_eq!(
+        voice_session(Some("my-room"), "/Users/me/code/app").as_deref(),
+        Some("my-room")
+    );
+    assert_eq!(
+        voice_session(Some(""), "/Users/me/code/app").as_deref(),
+        Some("-Users-me-code-app")
+    );
+    assert_eq!(voice_session(None, ""), None);
+    assert_eq!(project_slug("/w/a_b.c d"), "-w-a-b-c-d");
+    assert_eq!(
+        voice_card_path("/home/x", "room"),
+        "/home/x/.claude-tts/voice.d/room.json"
+    );
+}
+
+#[test]
+fn voice_card_is_read_from_disk_when_present() {
+    let dir = std::env::temp_dir().join(format!("csr-voice-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".claude-tts/voice.d")).unwrap();
+    let home = dir.to_str().unwrap();
+    std::fs::write(voice_card_path(home, "room"), CARD).unwrap();
+    let card = read_voice_card(&voice_card_path(home, "room")).unwrap();
+    assert_eq!(
+        voice_segment(&card).as_deref(),
+        Some("voice: claude-connery (bm_george) 1.8x")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

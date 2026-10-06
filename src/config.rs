@@ -47,6 +47,11 @@ pub(crate) struct Config {
     /// `CSR_EXTRAS=0` hides them all.
     #[serde(default = "default_true")]
     pub(crate) extras: bool,
+    /// Voice segment from claude-code-tts's voice card (`voice: amy 2.0x`),
+    /// shown only when a card exists for this session. On by default;
+    /// `voice: false` or `CSR_VOICE=0` hides it.
+    #[serde(default = "default_true")]
+    pub(crate) voice: bool,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -85,6 +90,7 @@ impl Default for Config {
             metrics_db: None,
             cache: true,
             extras: true,
+            voice: true,
         }
     }
 }
@@ -117,6 +123,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CSR_EXTRAS") {
             cfg.extras = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("CSR_VOICE") {
+            cfg.voice = truthy(&v);
         }
         cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);
