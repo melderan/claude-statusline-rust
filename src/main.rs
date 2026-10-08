@@ -158,7 +158,7 @@ fn main() {
         && cfg.metrics_db.is_some()
     {
         // The shared file is locked or unreachable: this row is skipped,
-        // never forced. One line, so a Stop hook or a log shows it.
+        // never forced. One line, so a hook or a log shows it.
         eprintln!("claude-statusline-rust: metrics skipped: {e}");
     }
     let residue: Vec<i64> = opened

@@ -1,22 +1,26 @@
 use crate::*;
 
 // ─────────────────────────────────────────────────────────────────────
-// --flush: copy local metrics into the house recorder
+// --flush: copy local metrics into a shared recorder database
 // ─────────────────────────────────────────────────────────────────────
 //
 // The render writes its rows to the local file (fast, WAL, survives a killed
 // render). `claude-statusline-rust --flush` copies the rows newer than the
 // last flushed id into a shared recorder database in one transaction, then
-// records the new high-water mark locally. It is the only path that writes
-// to the mount. It never removes a lock: a recorder it cannot open or lock
-// within the busy timeout means one stderr line and exit 0, so a Stop hook
-// is never blocked and nothing is forced.
+// records the new high-water mark locally. A recorder is a plain SQLite file
+// that several machines or containers write into, usually on a network or
+// shared mount, so one place holds the rows of every instance. The flush is
+// the only path that writes to that file. It never removes a lock: a recorder
+// it cannot open or lock within the busy timeout means one stderr line and
+// exit 0, so a Stop hook is never blocked and nothing is forced.
 //
-// Recorder schema (house ADR 0015, proposed): measures(id, ts, room, source,
-// buffer, source_id, session_id, prompt_id, kind, key, value, unit, data) with
-// UNIQUE(room, source, buffer, source_id), written with INSERT OR IGNORE so a
-// flush killed between the insert and the mark cannot write a row twice, and
-// a rebuilt room (local ids back at 1, a new buffer id) collides with nothing.
+// Recorder schema: measures(id, ts, room, source, buffer, source_id,
+// session_id, prompt_id, kind, key, value, unit, data) with
+// UNIQUE(room, source, buffer, source_id). `room` is the instance name (the
+// column name is a contract with other writers of the same file). Rows are
+// written with INSERT OR IGNORE so a flush killed between the insert and the
+// mark cannot write a row twice, and a local file that was deleted and
+// recreated (ids back at 1, a new buffer id) collides with nothing.
 
 pub(crate) const RECORDER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 pub(crate) const FLUSH_BATCH: i64 = 2000;
@@ -29,16 +33,17 @@ pub(crate) fn flush_main() {
         eprintln!("claude-statusline-rust --flush: CSR_RECORDER_DB is not set; nothing to do");
         return;
     };
-    // The room is the full sandbox name, never a trimmed tag: two houses can
-    // share one repo, and a tag would fold them into one room.
+    // The instance name: CSR_ROOM, else SANDBOX_NAME, else none. It is the
+    // full value, never a shortened tag, so two environments that share a
+    // repository name stay apart in the recorder.
     let Some(room) = env_nonblank("CSR_ROOM").or_else(|| env_nonblank("SANDBOX_NAME")) else {
         eprintln!(
             "claude-statusline-rust --flush: CSR_ROOM (or SANDBOX_NAME) is not set; nothing to do"
         );
         return;
     };
-    // Every refusal below exits 0: the flush is a Stop hook's errand and a
-    // failed errand must never fail the session. The message is the signal.
+    // Every refusal below exits 0: the flush usually runs from a Stop hook and
+    // a failed flush must never fail the session. The message is the signal.
     match run_flush(&cfg, &home, &recorder, &room) {
         Ok(r) => {
             println!(
@@ -75,13 +80,13 @@ pub(crate) const MEASURES_COLUMNS: &str =
 
 /// The recorder's idempotence key, in order. A recorder whose unique index
 /// is anything else is refused before a byte is written: with the old
-/// three-part key a rebuilt room's rows would be silently dropped again.
+/// three-part key the rows of a recreated local file would be silently dropped.
 pub(crate) const RECORDER_KEY: [&str; 4] = ["room", "source", "buffer", "source_id"];
 
-/// Open the recorder the house way: dotfile lock, rollback journal, a few
-/// seconds of patience, no lock removal. An existing `measures` table must
-/// carry a unique index on exactly RECORDER_KEY; a missing table is created
-/// from the house DDL. Nothing is written to a file that fails the check.
+/// Open the recorder: dotfile lock, rollback journal, a few seconds of
+/// patience, no lock removal. An existing `measures` table must carry a
+/// unique index on exactly RECORDER_KEY; a missing table is created from the
+/// DDL below. Nothing is written to a file that fails the check.
 pub(crate) fn open_recorder(path: &str) -> DbResult<Connection> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -107,8 +112,8 @@ pub(crate) fn open_recorder(path: &str) -> DbResult<Connection> {
         check_recorder_key(&conn)?;
     }
     conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
-    // The house recorder DDL, applied verbatim by every writer (house ADR 0015
-    // point 5; the same text lives in the house's commons/schema/recorder.sql).
+    // The recorder DDL, applied verbatim by every writer so that all of them
+    // agree on the shape of the table.
     let create = "CREATE TABLE IF NOT EXISTS measures (
     id         INTEGER PRIMARY KEY,
     ts         TEXT    NOT NULL,
@@ -228,9 +233,10 @@ pub(crate) fn check_recorder_key(conn: &Connection) -> DbResult<()> {
 }
 
 /// The local file's identity: a random id minted the first time the file is
-/// used for a flush and kept in it. A rebuilt room starts its local ids at 1
-/// again, so (room, source, source_id) alone would collide with the old
-/// life's rows; the buffer id tells the lives apart. The guarantee against two
+/// used for a flush and kept in it. A local file that is deleted and recreated
+/// (a rebuilt container, say) starts its ids at 1 again, so
+/// (room, source, source_id) alone would collide with the earlier file's rows;
+/// the buffer id tells the two apart. The guarantee against two
 /// first flushes at once (a doubled Stop hook) minting two ids is the
 /// singleton primary key: INSERT OR IGNORE on `k = 1` lets exactly one
 /// candidate in, and every caller reads that one back. The transaction only

@@ -18,10 +18,11 @@ pub(crate) struct VoiceCard {
     pub(crate) muted: Option<bool>,
 }
 
-/// The session id claude-tts keys the card by: `$CLAUDE_TTS_SESSION` (the
-/// kits set it to the room's name), else the Claude Code project folder
-/// name. The pin under `active/<host>-<pid>.session` is not tried: the
-/// binary has no portable parent pid and the first two cover every room.
+/// The session id claude-tts keys the card by: `$CLAUDE_TTS_SESSION` when the
+/// environment sets it (a launcher can use it to name the session), else the
+/// Claude Code project folder name. The pin under `active/<host>-<pid>.session`
+/// is not tried: the binary has no portable parent pid, and the first two
+/// cover the usual setups.
 pub(crate) fn voice_session(env_session: Option<&str>, project_dir: &str) -> Option<String> {
     if let Some(s) = env_session
         && !s.is_empty()
@@ -52,11 +53,11 @@ pub(crate) fn read_voice_card(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// `voice: statusline-amy (en_US-amy-medium) 2.0x`, `muted` appended when
+/// `voice: narrator (en_US-demo-medium) 2.0x`, `muted` appended when
 /// the session is muted. None for a card of another schema or without a
 /// persona. The engine's voice string is shortened to the part after the
-/// last colon (an mlx speaker preset), so `mlx-community/Kokoro-82M-bf16:af_heart`
-/// reads as `af_heart`.
+/// last colon (a speaker preset), so `some-engine/model-bf16:speaker_a`
+/// reads as `speaker_a`.
 pub(crate) fn voice_segment(card_json: &str) -> Option<String> {
     let card: VoiceCard = serde_json::from_str(card_json).ok()?;
     if card.schema != Some(VOICE_CARD_SCHEMA) {

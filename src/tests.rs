@@ -291,7 +291,7 @@ fn schema_migrates_old_table_and_residue_reads_back() {
     assert!(residue_deltas(&conn, "other", 5).unwrap().is_empty());
 
     // A turn with many API responses must not push older turns out of the
-    // window (review finding: the old row-based limit did).
+    // window (a row-based limit used to).
     for i in 1..=200_i64 {
         log_metrics(
             &conn,
@@ -368,17 +368,17 @@ fn memory_bytes_walks_subdirectories() {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let rooms = root.join("rooms").join("tts");
-    std::fs::create_dir_all(&rooms).unwrap();
+    let topics = root.join("topics").join("deep");
+    std::fs::create_dir_all(&topics).unwrap();
     std::fs::write(root.join("MEMORY.md"), vec![b'x'; 100]).unwrap();
     std::fs::write(root.join("a.md"), vec![b'x'; 10]).unwrap();
     std::fs::write(root.join("notes.txt"), vec![b'x'; 1000]).unwrap();
-    std::fs::write(rooms.join("b.md"), vec![b'x'; 20]).unwrap();
+    std::fs::write(topics.join("b.md"), vec![b'x'; 20]).unwrap();
     // A nested MEMORY.md is an ordinary file, not the index.
-    std::fs::write(rooms.join("MEMORY.md"), vec![b'x'; 30]).unwrap();
+    std::fs::write(topics.join("MEMORY.md"), vec![b'x'; 30]).unwrap();
     let (idx, other) = memory_bytes_in(&root);
     assert_eq!(idx, 100);
-    assert_eq!(other, 60, "a.md + rooms/tts/b.md + rooms/tts/MEMORY.md");
+    assert_eq!(other, 60, "a.md + topics/deep/b.md + topics/deep/MEMORY.md");
     assert_eq!(memory_bytes_in(&root.join("missing")), (0, 0));
 
     // Symlinks: a linked file counts, a linked directory is walked, and a
@@ -393,7 +393,7 @@ fn memory_bytes_walks_subdirectories() {
         std::fs::write(outside.join("far.md"), vec![b'x'; 7]).unwrap();
         symlink(outside.join("far.md"), root.join("link.md")).unwrap();
         symlink(&outside, root.join("linked-dir")).unwrap();
-        symlink(&root, rooms.join("loop")).unwrap();
+        symlink(&root, topics.join("loop")).unwrap();
         let (idx, other) = memory_bytes_in(&root);
         assert_eq!(idx, 100);
         assert_eq!(
@@ -401,7 +401,7 @@ fn memory_bytes_walks_subdirectories() {
             60 + 7,
             "link.md and linked-dir/far.md are one file, counted once"
         );
-        // The memory directory itself may be a symlink (the house layout).
+        // The memory directory itself may be a symlink (a common layout).
         let link_to_root = outside.join("memory");
         symlink(&root, &link_to_root).unwrap();
         assert_eq!(memory_bytes_in(&link_to_root), (100, 67));
@@ -412,7 +412,7 @@ fn memory_bytes_walks_subdirectories() {
 
 #[test]
 fn claude_md_import_syntax() {
-    let text = "See @/abs/file.md and @~/home.md here\n@./rel.md\n  @../up.md,\nmail me@example.com or @handle\n```\n@/in/fence.md\n```\n@docs/guide.md.\n@HOUSE.md\n~~~\n@/in/tilde/fence.md\n~~~\nuse `@/in/code.md` not that\n@./é.md @./b.md\n``@/in/double.md``\n````\n```\n@/in/four.md\n````\n    @/indented.md\n`unmatched @./after.md\nsee `code @/in/span.md` here\n";
+    let text = "See @/abs/file.md and @~/home.md here\n@./rel.md\n  @../up.md,\nmail me@example.com or @handle\n```\n@/in/fence.md\n```\n@docs/guide.md.\n@NOTES.md\n~~~\n@/in/tilde/fence.md\n~~~\nuse `@/in/code.md` not that\n@./é.md @./b.md\n``@/in/double.md``\n````\n```\n@/in/four.md\n````\n    @/indented.md\n`unmatched @./after.md\nsee `code @/in/span.md` here\n";
     assert_eq!(
         claude_md_imports(text),
         vec![
@@ -422,7 +422,7 @@ fn claude_md_import_syntax() {
             "../up.md",
             "handle",
             "docs/guide.md",
-            "HOUSE.md",
+            "NOTES.md",
             "./é.md",
             "./b.md",
             "./after.md"
@@ -473,10 +473,10 @@ fn always_on_counts_the_chain_once() {
     // Parent-directory CLAUDE.md: relative import, bare import, fenced import, inline code.
     w(
         &root.join("repos").join("CLAUDE.md"),
-        "parent\n@./inc.md\n@HOUSE.md\n```\n@./ignored.md\n```\nsee `@./ignored.md`\n",
+        "parent\n@./inc.md\n@NOTES.md\n```\n@./ignored.md\n```\nsee `@./ignored.md`\n",
     );
     w(&root.join("repos").join("inc.md"), "12345");
-    w(&root.join("repos").join("HOUSE.md"), "house rules");
+    w(&root.join("repos").join("NOTES.md"), "plain notes");
     w(&root.join("repos").join("ignored.md"), "should not count");
     // Project files; the local one has a non-ASCII name and invalid UTF-8 inside.
     w(&proj.join("CLAUDE.md"), "project\n@./é.md @./b.md\n");
@@ -509,7 +509,7 @@ fn always_on_counts_the_chain_once() {
             ("shared.md".to_string(), 38),
             ("CLAUDE.md".to_string(), 69),
             ("inc.md".to_string(), 5),
-            ("HOUSE.md".to_string(), 11),
+            ("NOTES.md".to_string(), 11),
             ("CLAUDE.md".to_string(), 24),
             ("é.md".to_string(), 2),
             ("b.md".to_string(), 2),
@@ -685,7 +685,7 @@ fn open_metrics_db_creates_the_parent_directory() {
 #[test]
 fn shared_metrics_db_locks_with_a_dotfile_and_never_removes_one() {
     let dir = fresh_dir("db");
-    let path = dir.join("room.sqlite");
+    let path = dir.join("local.sqlite");
     let p = path.to_string_lossy().to_string();
     let lock = format!("{p}.lock");
     let on = AlwaysOn {
@@ -794,7 +794,7 @@ fn shared_metrics_db_locks_with_a_dotfile_and_never_removes_one() {
     assert!(files.contains("/x/CLAUDE.md"));
     drop(conn);
     assert!(
-        !dir.join("room.sqlite-wal").exists(),
+        !dir.join("local.sqlite-wal").exists(),
         "no WAL beside a shared database"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -835,7 +835,7 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
     std::fs::create_dir_all(&home).unwrap();
     let h = home.to_string_lossy().to_string();
     let cfg = Config::default(); // local file under home/.config/dbg, WAL
-    let recorder = dir.join("house").join("recorder.sqlite");
+    let recorder = dir.join("shared").join("recorder.sqlite");
     let rp = recorder.to_string_lossy().to_string();
     {
         let local = open_metrics_db(&cfg, &h).unwrap();
@@ -844,7 +844,7 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
         log_row(&local, "p3", 90_000, 3, &on(120));
     }
     // First flush: three call rows plus two always_on rows (100, then 120).
-    assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 5);
+    assert_eq!(run_flush(&cfg, &h, &rp, "inst-a").unwrap().inserted, 5);
     let rec = open_recorder(&rp).unwrap();
     let count = |sql: &str| -> i64 { rec.query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(
@@ -866,7 +866,7 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
         ts.ends_with('Z') && ts.contains('.'),
         "ISO UTC with milliseconds: {ts}"
     );
-    assert_eq!(room, "roomA");
+    assert_eq!(room, "inst-a");
     assert_eq!(buffer.len(), 32);
     assert_eq!(value, 90_000.0);
     assert_eq!(unit, "tokens");
@@ -887,7 +887,7 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
     assert!(files.contains("/a/CLAUDE.md"));
 
     // Second flush: nothing new.
-    assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 0);
+    assert_eq!(run_flush(&cfg, &h, &rp, "inst-a").unwrap().inserted, 0);
     assert_eq!(count("SELECT COUNT(*) FROM measures"), 5);
 
     // A flush that lost its mark (killed before the update) inserts nothing twice.
@@ -898,7 +898,7 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
             .unwrap();
     }
     assert_eq!(
-        run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted,
+        run_flush(&cfg, &h, &rp, "inst-a").unwrap().inserted,
         0,
         "reported count is rows inserted"
     );
@@ -909,7 +909,7 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
         let local = open_metrics_db(&cfg, &h).unwrap();
         log_row(&local, "p4", 95_000, 4, &on(120));
     }
-    assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 1);
+    assert_eq!(run_flush(&cfg, &h, &rp, "inst-a").unwrap().inserted, 1);
     assert_eq!(count("SELECT COUNT(*) FROM measures"), 6);
     drop(rec);
 
@@ -921,7 +921,7 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
         log_row(&local, "p5", 97_000, 5, &on(120));
     }
     let t0 = std::time::Instant::now();
-    let err = run_flush(&cfg, &h, &rp, "roomA").unwrap_err().to_string();
+    let err = run_flush(&cfg, &h, &rp, "inst-a").unwrap_err().to_string();
     assert!(err.starts_with("recorder "), "which file was locked: {err}");
     assert!(t0.elapsed() < std::time::Duration::from_secs(10));
     assert!(
@@ -936,15 +936,15 @@ fn flush_copies_new_rows_once_and_skips_a_held_lock() {
         assert_eq!(last, 4, "mark unchanged by a skipped flush");
     }
     std::fs::remove_dir_all(&lock).unwrap();
-    assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 1);
-    assert!(!dir.join("house").join("recorder.sqlite-wal").exists());
+    assert_eq!(run_flush(&cfg, &h, &rp, "inst-a").unwrap().inserted, 1);
+    assert!(!dir.join("shared").join("recorder.sqlite-wal").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn flush_tells_a_rebuilt_room_apart() {
-    // Review HIGH: a rebuilt room restarts local ids at 1; without the
-    // buffer id its rows collided on the unique key and were dropped.
+fn flush_tells_a_recreated_local_file_apart() {
+    // A recreated local file restarts its ids at 1; without the buffer id its
+    // rows collided on the unique key and were dropped.
     let dir = fresh_dir("rebuilt");
     let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
     let cfg = Config::default();
@@ -960,8 +960,8 @@ fn flush_tells_a_rebuilt_room_apart() {
     };
     let h1 = life("life1", &[("p1", 84_000), ("p2", 88_000), ("p3", 90_000)]);
     let h2 = life("life2", &[("q1", 50_000), ("q2", 52_000)]);
-    assert_eq!(run_flush(&cfg, &h1, &rp, "roomA").unwrap().inserted, 4); // 3 calls + 1 always_on
-    assert_eq!(run_flush(&cfg, &h2, &rp, "roomA").unwrap().inserted, 3); // 2 calls + 1 always_on
+    assert_eq!(run_flush(&cfg, &h1, &rp, "inst-a").unwrap().inserted, 4); // 3 calls + 1 always_on
+    assert_eq!(run_flush(&cfg, &h2, &rp, "inst-a").unwrap().inserted, 3); // 2 calls + 1 always_on
     let rec = open_recorder(&rp).unwrap();
     let calls: i64 = rec
         .query_row(
@@ -1005,16 +1005,16 @@ fn flush_marks_are_per_recorder_and_the_source_is_the_configured_file() {
     );
     let ra = dir.join("a.sqlite").to_string_lossy().to_string();
     let rb = dir.join("b.sqlite").to_string_lossy().to_string();
-    assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap().inserted, 3);
+    assert_eq!(run_flush(&cfg, &h, &ra, "inst-a").unwrap().inserted, 3);
     assert_eq!(
-        run_flush(&cfg, &h, &rb, "roomA").unwrap().inserted,
+        run_flush(&cfg, &h, &rb, "inst-a").unwrap().inserted,
         3,
         "a second recorder has its own mark"
     );
-    assert_eq!(run_flush(&cfg, &h, &ra, "roomA").unwrap().inserted, 0);
+    assert_eq!(run_flush(&cfg, &h, &ra, "inst-a").unwrap().inserted, 0);
     // Two spellings of one recorder path share one mark.
     let ra2 = dir.join(".").join("a.sqlite").to_string_lossy().to_string();
-    assert_eq!(run_flush(&cfg, &h, &ra2, "roomA").unwrap().inserted, 0);
+    assert_eq!(run_flush(&cfg, &h, &ra2, "inst-a").unwrap().inserted, 0);
     let local = open_metrics_db(&cfg, &h).unwrap();
     let marks: i64 = local
         .query_row("SELECT COUNT(*) FROM flush_state", [], |r| r.get(0))
@@ -1111,7 +1111,7 @@ fn recorder_refuses_the_wrong_unique_key_without_writing() {
         let local = open_metrics_db(&cfg, &home.to_string_lossy()).unwrap();
         log_row(&local, "p1", 84_000, 1, &on(100));
     }
-    let err = run_flush(&cfg, &home.to_string_lossy(), &rp, "roomA")
+    let err = run_flush(&cfg, &home.to_string_lossy(), &rp, "inst-a")
         .unwrap_err()
         .to_string();
     assert!(
@@ -1138,13 +1138,13 @@ fn flush_reports_rows_left_behind_by_the_batch_cap() {
         local.execute_batch("COMMIT").unwrap();
     }
     let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
-    let r = run_flush(&cfg, &h, &rp, "roomA").unwrap();
+    let r = run_flush(&cfg, &h, &rp, "inst-a").unwrap();
     assert_eq!(r.left_behind, 5, "the cap must be reported with the count");
     assert_eq!(
         r.inserted as i64,
         FLUSH_BATCH * FLUSH_MAX_BATCHES as i64 + 1
     );
-    let r = run_flush(&cfg, &h, &rp, "roomA").unwrap();
+    let r = run_flush(&cfg, &h, &rp, "inst-a").unwrap();
     assert_eq!((r.inserted, r.left_behind), (5, 0));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1161,7 +1161,7 @@ fn flush_treats_an_unreadable_previous_always_on_as_an_error() {
         let local = open_metrics_db(&cfg, &h).unwrap();
         log_row(&local, "p1", 84_000, 1, &on(100));
     }
-    assert_eq!(run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted, 2);
+    assert_eq!(run_flush(&cfg, &h, &rp, "inst-a").unwrap().inserted, 2);
     {
         let local = open_metrics_db(&cfg, &h).unwrap();
         // SQLite keeps text in an INTEGER column; the previous-value read then fails.
@@ -1173,7 +1173,7 @@ fn flush_treats_an_unreadable_previous_always_on_as_an_error() {
             .unwrap();
         log_row(&local, "p2", 88_000, 2, &on(100));
     }
-    let err = run_flush(&cfg, &h, &rp, "roomA").unwrap_err().to_string();
+    let err = run_flush(&cfg, &h, &rp, "inst-a").unwrap_err().to_string();
     assert!(
         err.starts_with("local metrics file ") && err.contains("row 1"),
         "{err}"
@@ -1348,7 +1348,7 @@ fn flush_names_the_row_of_a_bad_local_value() {
             .unwrap();
     }
     let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
-    let err = run_flush(&cfg, &h, &rp, "roomA").unwrap_err().to_string();
+    let err = run_flush(&cfg, &h, &rp, "inst-a").unwrap_err().to_string();
     assert!(err.contains("row 2") && err.contains("in_tokens"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1404,7 +1404,7 @@ fn flush_walks_every_batch_of_a_long_backlog() {
     }
     let rp = dir.join("recorder.sqlite").to_string_lossy().to_string();
     assert_eq!(
-        run_flush(&cfg, &h, &rp, "roomA").unwrap().inserted as i64,
+        run_flush(&cfg, &h, &rp, "inst-a").unwrap().inserted as i64,
         n + 1,
         "every local row plus one always_on row, across two batches"
     );
@@ -1674,20 +1674,20 @@ fn a_surprising_sub_object_shape_costs_one_segment_not_the_line() {
 
 // ── voice card (claude-code-tts docs/voice-card.md, schema 1) ──
 
-const CARD: &str = r#"{"schema":1,"session":"-Users-me-code-app","persona":"claude-connery","backend":"mlx",
-  "voice":"mlx-community/Kokoro-82M-bf16:bm_george","speed":1.8,"muted":false,"intermediate":true,"mode":"queue",
+const CARD: &str = r#"{"schema":1,"session":"-Users-me-code-app","persona":"my-persona","backend":"mlx",
+  "voice":"some-engine/model-bf16:speaker_a","speed":1.8,"muted":false,"intermediate":true,"mode":"queue",
   "written_at":"2026-10-05T22:50:12Z","claude_tts":"9.48.0"}"#;
 
 #[test]
 fn voice_segment_reads_the_card_and_shortens_the_engine_voice() {
     assert_eq!(
         voice_segment(CARD).as_deref(),
-        Some("voice: claude-connery (bm_george) 1.8x")
+        Some("voice: my-persona (speaker_a) 1.8x")
     );
-    let piper = r#"{"schema":1,"persona":"statusline-amy","backend":"piper","voice":"en_US-amy-medium","speed":2.0,"muted":true}"#;
+    let piper = r#"{"schema":1,"persona":"my-piper","backend":"piper","voice":"en_US-demo-medium","speed":2.0,"muted":true}"#;
     assert_eq!(
         voice_segment(piper).as_deref(),
-        Some("voice: statusline-amy (en_US-amy-medium) 2.0x muted")
+        Some("voice: my-piper (en_US-demo-medium) 2.0x muted")
     );
 }
 
@@ -1706,8 +1706,8 @@ fn voice_segment_shows_nothing_it_does_not_understand() {
 #[test]
 fn voice_session_prefers_the_env_then_the_project_slug() {
     assert_eq!(
-        voice_session(Some("my-room"), "/Users/me/code/app").as_deref(),
-        Some("my-room")
+        voice_session(Some("my-session"), "/Users/me/code/app").as_deref(),
+        Some("my-session")
     );
     assert_eq!(
         voice_session(Some(""), "/Users/me/code/app").as_deref(),
@@ -1716,8 +1716,8 @@ fn voice_session_prefers_the_env_then_the_project_slug() {
     assert_eq!(voice_session(None, ""), None);
     assert_eq!(project_slug("/w/a_b.c d"), "-w-a-b-c-d");
     assert_eq!(
-        voice_card_path("/home/x", "room"),
-        "/home/x/.claude-tts/voice.d/room.json"
+        voice_card_path("/home/x", "session"),
+        "/home/x/.claude-tts/voice.d/session.json"
     );
 }
 
@@ -1726,11 +1726,11 @@ fn voice_card_is_read_from_disk_when_present() {
     let dir = std::env::temp_dir().join(format!("csr-voice-{}", std::process::id()));
     std::fs::create_dir_all(dir.join(".claude-tts/voice.d")).unwrap();
     let home = dir.to_str().unwrap();
-    std::fs::write(voice_card_path(home, "room"), CARD).unwrap();
-    let card = read_voice_card(&voice_card_path(home, "room")).unwrap();
+    std::fs::write(voice_card_path(home, "session"), CARD).unwrap();
+    let card = read_voice_card(&voice_card_path(home, "session")).unwrap();
     assert_eq!(
         voice_segment(&card).as_deref(),
-        Some("voice: claude-connery (bm_george) 1.8x")
+        Some("voice: my-persona (speaker_a) 1.8x")
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

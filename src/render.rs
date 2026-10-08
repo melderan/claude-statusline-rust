@@ -1,7 +1,10 @@
 use crate::*;
 
-// System prompt + tools + MCP tokens not surfaced to the hook JSON.
-// See github.com/anthropics/claude-code/issues/13783. PAI's documented baseline.
+// Fixed estimate, in tokens, of what the model reads before the first
+// message: the system prompt, the tool definitions and MCP tool schemas. The
+// hook JSON does not break these out, so the ctx figure adds this constant to
+// the per-call token counts. An estimate, not a measurement; background in
+// github.com/anthropics/claude-code/issues/13783.
 pub(crate) const CONTEXT_BASELINE: i64 = 22_600;
 
 // ─────────────────────────────────────────────────────────────────────

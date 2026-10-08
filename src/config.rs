@@ -47,7 +47,7 @@ pub(crate) struct Config {
     /// `CSR_EXTRAS=0` hides them all.
     #[serde(default = "default_true")]
     pub(crate) extras: bool,
-    /// Voice segment from claude-code-tts's voice card (`voice: amy 2.0x`),
+    /// Voice segment from claude-code-tts's voice card (`voice: narrator 2.0x`),
     /// shown only when a card exists for this session. On by default;
     /// `voice: false` or `CSR_VOICE=0` hides it.
     #[serde(default = "default_true")]

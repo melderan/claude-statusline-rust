@@ -77,7 +77,7 @@ pub(crate) fn open_metrics_at(
     conn.busy_timeout(patience)?;
     // Switching a brand-new file to WAL needs an exclusive lock, and SQLite
     // answers BUSY at once without consulting the busy handler, so several
-    // first openers of a room's life would all skip. Retry within patience.
+    // first openers of a new file would all skip. Retry within patience.
     let mode = if shared { "DELETE" } else { "WAL" };
     let deadline = std::time::Instant::now() + patience;
     loop {

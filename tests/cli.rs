@@ -51,7 +51,7 @@ fn run(
 #[test]
 fn locked_shared_db_keeps_the_display_and_warns_once() {
     let dir = fresh_dir("locked");
-    let db = dir.join("room.sqlite");
+    let db = dir.join("local.sqlite");
     let dbs = db.to_string_lossy().to_string();
     let (code, unlocked, err) = run(&dir, &[("CSR_METRICS_DB", &dbs)], &[], HOOK);
     assert_eq!(code, 0);
@@ -85,7 +85,7 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
     assert_eq!(code, 0);
     assert_eq!(out, "");
     assert!(err.contains("CSR_ROOM"), "{err}");
-    assert!(!rec.exists(), "no room, no recorder file");
+    assert!(!rec.exists(), "no instance name, no recorder file");
 
     // A plain render with the flush env set does not flush.
     let (code, out, _) = run(
@@ -104,7 +104,7 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
         &[
             ("CSR_RECORDER_DB", &recs),
             ("CSR_ROOM", "  "),
-            ("SANDBOX_NAME", "sbx--x--room"),
+            ("SANDBOX_NAME", "name-from-env"),
         ],
         &["--flush"],
         "",
@@ -123,7 +123,7 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
         "unix-dotfile",
     )
     .unwrap();
-    let rooms: Vec<String> = conn
+    let names: Vec<String> = conn
         .prepare("SELECT DISTINCT room FROM measures")
         .unwrap()
         .query_map([], |r| r.get(0))
@@ -131,15 +131,15 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
         .map(|r| r.unwrap())
         .collect();
     assert_eq!(
-        rooms,
-        vec!["sbx--x--room"],
-        "blank CSR_ROOM falls back to the full sandbox name"
+        names,
+        vec!["name-from-env"],
+        "blank CSR_ROOM falls back to the full SANDBOX_NAME"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn first_renders_of_a_rooms_life_all_write() {
+fn first_renders_of_a_new_file_all_write() {
     // PRAGMA journal_mode=WAL on a brand-new file answers BUSY without the
     // busy handler, so concurrent first renders used to skip their rows.
     // Separate connections in one process share SQLite's lock state and do
