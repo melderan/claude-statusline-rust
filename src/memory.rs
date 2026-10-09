@@ -34,10 +34,12 @@ pub(crate) fn relative_current(project: &str, current: &str) -> Option<String> {
     }
 }
 
-/// Claude Code memory slug: absolute path with '/' → '-'.
-/// Matches ~/.claude/projects/<slug>/memory/ layout.
+/// Claude Code project slug, the directory name under `~/.claude/projects/`:
+/// every character that is not an ASCII letter or digit becomes a dash, so
+/// `/home/me/my.app` is `-home-me-my-app`. Replacing only the slashes missed
+/// the memory directory for any path with a dot or an underscore in it.
 pub(crate) fn path_to_memory_slug(abs_path: &str) -> String {
-    abs_path.replace('/', "-")
+    crate::voice::project_slug(abs_path)
 }
 
 /// Returns (MEMORY.md bytes, other-memory-files bytes).

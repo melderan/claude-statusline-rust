@@ -202,8 +202,10 @@ pub(crate) fn log_metrics(
 ) -> DbResult<()> {
     let last: Option<(i64, i64, f64, f64, i64, i64)> = conn
         .query_row(
-            "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1), COALESCE(content, -1), COALESCE(always_on_chars, -1) FROM metrics ORDER BY id DESC LIMIT 1",
-            [],
+            // This session's last row, not the last row of any session: two
+            // sessions reporting the same numbers back to back are two rows.
+            "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1), COALESCE(content, -1), COALESCE(always_on_chars, -1) FROM metrics WHERE session_id IS ?1 ORDER BY id DESC LIMIT 1",
+            [session_id],
             |row| {
                 Ok((
                     row.get(0)?,

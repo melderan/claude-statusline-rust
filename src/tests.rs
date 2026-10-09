@@ -53,6 +53,10 @@ fn memory_slug() {
         "-Users-foo-code-bar"
     );
     assert_eq!(path_to_memory_slug("/"), "-");
+    assert_eq!(
+        path_to_memory_slug("/home/me/my.app_v2"),
+        "-home-me-my-app-v2"
+    );
 }
 
 #[test]
@@ -778,10 +782,13 @@ fn shared_metrics_db_locks_with_a_dotfile_and_never_removes_one() {
     for a in [&on, &on, &on2] {
         log(&conn, a).unwrap();
     }
+    // The bare 'x' row above belongs to no session, so `on` is still a repeat
+    // of this session's last row and writes nothing; the changed always-on
+    // is a new row.
     assert_eq!(
         count(),
-        before + 2,
-        "same input is one row; a changed always-on is another"
+        before + 1,
+        "a repeat of this session's last row is no row; a changed always-on is one"
     );
     let (chars, files): (i64, String) = conn
         .query_row(
@@ -1732,5 +1739,104 @@ fn voice_card_is_read_from_disk_when_present() {
         voice_segment(&card).as_deref(),
         Some("voice: my-persona (speaker_a) 1.8x")
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Review fixes ──────────────────────────────────────────────────────
+
+/// Two sessions reporting the same numbers back to back are two rows; the
+/// duplicate check looks at this session's last row only.
+#[test]
+fn identical_rows_from_two_sessions_are_both_kept() {
+    let conn = Connection::open_in_memory().unwrap();
+    ensure_schema(&conn).unwrap();
+    for sid in ["s1", "s2", "s1"] {
+        log_metrics(
+            &conn,
+            "proj",
+            None,
+            Some("Fable"),
+            Some(sid),
+            Some("p1"),
+            Some(50_000),
+            50_000,
+            10,
+            200_000,
+            25.0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM metrics", [], |r| r.get(0))
+        .unwrap();
+    // s1, then s2 (new session, kept), then s1 again (same as s1's last row, dropped).
+    assert_eq!(n, 2);
+}
+
+/// Ahead/behind across a merge commit, checked against git's own left-right
+/// count. Layout: A - B - M (upstream) where M merges C; C - D (head). Head is
+/// one ahead (D) and two behind (B, M). A walk that stops at the first sight
+/// of the merge base C gets this wrong when the walk reaches C before B.
+#[test]
+fn ahead_behind_counts_across_a_merge() {
+    let dir = std::env::temp_dir().join(format!("csr-ab-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let commit = |msg: &str| {
+        std::fs::write(dir.join(msg), msg).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", msg]);
+    };
+    git(&["init", "-q", "-b", "main"]);
+    commit("A");
+    git(&["checkout", "-q", "-b", "feature"]);
+    commit("C");
+    git(&["checkout", "-q", "main"]);
+    commit("B");
+    git(&["merge", "-q", "--no-ff", "-m", "M", "feature"]);
+    git(&["checkout", "-q", "feature"]);
+    commit("D");
+    // feature tracks a "remote" branch that points at main's merge commit.
+    git(&["update-ref", "refs/remotes/origin/feature", "main"]);
+    git(&[
+        "config",
+        "remote.origin.url",
+        "https://example.invalid/r.git",
+    ]);
+    git(&[
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*",
+    ]);
+    git(&["config", "branch.feature.remote", "origin"]);
+    git(&["config", "branch.feature.merge", "refs/heads/feature"]);
+
+    let expect = git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"]);
+    assert_eq!(expect, "1\t2", "git's own count is the oracle");
+
+    let repo = gix::open(&dir).unwrap();
+    assert_eq!(ahead_behind(&repo), Some((1, 2)));
     let _ = std::fs::remove_dir_all(&dir);
 }

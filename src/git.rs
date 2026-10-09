@@ -50,32 +50,28 @@ pub(crate) fn ahead_behind(repo: &gix::Repository) -> Option<(u32, u32)> {
         .ok()?;
     let upstream_ref = repo.find_reference(upstream.as_ref()).ok()?;
     let upstream_oid = upstream_ref.id();
-    let mut ahead = 0u32;
-    let mut behind = 0u32;
-    // left-right counts via rev_walk
-    let platform = repo
-        .rev_walk([head_oid.detach(), upstream_oid.detach()])
-        .sorting(gix::revision::walk::Sorting::BreadthFirst);
-    // Simpler: compute merge base, then count commits on each side.
-    let base = repo
-        .merge_base(head_oid.detach(), upstream_oid.detach())
-        .ok()?;
-    for info in repo.rev_walk([head_oid.detach()]).all().ok()? {
-        let info = info.ok()?;
-        if info.id == base {
-            break;
-        }
-        ahead += 1;
-    }
-    for info in repo.rev_walk([upstream_oid.detach()]).all().ok()? {
-        let info = info.ok()?;
-        if info.id == base {
-            break;
-        }
-        behind += 1;
-    }
-    let _ = platform;
+    // The same counts as `git rev-list --left-right --count HEAD...@{u}`:
+    // commits reachable from one tip and not from the other. Hiding the other
+    // tip's ancestors is what makes this right across merge commits; a walk
+    // that stops when it first meets the merge base counts commits older than
+    // the base that the walk reaches first on another parent.
+    let ahead = count_only(repo, head_oid.detach(), upstream_oid.detach())?;
+    let behind = count_only(repo, upstream_oid.detach(), head_oid.detach())?;
     Some((ahead, behind))
+}
+
+/// Commits reachable from `tip` and not from `hidden`. None on any walk error.
+pub(crate) fn count_only(
+    repo: &gix::Repository,
+    tip: gix::ObjectId,
+    hidden: gix::ObjectId,
+) -> Option<u32> {
+    let mut n = 0u32;
+    for info in repo.rev_walk([tip]).with_hidden([hidden]).all().ok()? {
+        info.ok()?;
+        n += 1;
+    }
+    Some(n)
 }
 
 pub(crate) fn is_dirty(repo: &gix::Repository) -> Option<bool> {
