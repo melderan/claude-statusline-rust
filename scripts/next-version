@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Suggest the next version from the [Unreleased] section of CHANGELOG.md, with the reason.
+# Usage: scripts/next-version        (prints one line: the version and why; exit 1 when nothing is unreleased)
+# Rule (VERSIONING.md): a Removed entry, a "Migration" heading or a line containing "BREAKING"
+# means MAJOR; an Added entry means MINOR; anything else means PATCH. A suggestion, not a verdict:
+# a Changed entry that an existing user would notice is MAJOR too, and only a reader can tell.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+current="$(awk '/^\[/ { in_pkg = ($0 == "[package]") } in_pkg && /^version[[:space:]]*=/ { gsub(/.*=[[:space:]]*"|".*/, ""); print; exit }' Cargo.toml)"
+[ -n "$current" ] || { echo "next-version: no version in Cargo.toml" >&2; exit 1; }
+IFS=.- read -r maj min pat _rest <<<"${current//-rc./-}"
+
+section="$(awk '/^## \[Unreleased\]/ { on = 1; next } /^## \[/ { on = 0 } on { print }' CHANGELOG.md)"
+entries="$(printf '%s\n' "$section" | grep -c '^- ' || true)"
+[ "$entries" -gt 0 ] || { echo "next-version: [Unreleased] has no entries; nothing to release" >&2; exit 1; }
+
+group=""; major=0; minor=0; why=""
+while IFS= read -r line; do
+  case "$line" in
+    "### "*) group="${line#\#\#\# }" ;;
+    "- "*)
+      case "$line" in *BREAKING*) major=1; why="a BREAKING entry" ;; esac
+      case "$group" in
+        Removed) major=1; why="${why:-a Removed entry}" ;;
+        Migration) major=1; why="${why:-a Migration section}" ;;
+        Added) minor=1 ;;
+      esac ;;
+  esac
+done <<<"$section"
+
+if [ "$current" = "0.0.0" ] || [ "$maj" -eq 0 ]; then
+  echo "1.0.0  first release: the project does not use a 0.x line (VERSIONING.md)"
+elif [ "$major" -eq 1 ]; then
+  echo "$((maj + 1)).0.0  MAJOR: $why"
+elif [ "$minor" -eq 1 ]; then
+  echo "$maj.$((min + 1)).0  MINOR: an Added entry, nothing removed"
+else
+  echo "$maj.$min.$((pat + 1))  PATCH: only fixes and changes nobody has to act on"
+fi

@@ -29,8 +29,30 @@ use metrics::*;
 use render::*;
 use voice::*;
 
+const HELP: &str = "\
+claude-statusline-rust: a status line for Claude Code.
+
+Reads the status line hook JSON on stdin and prints the lines on stdout.
+Configure it in ~/.claude/settings.json under \"statusLine\".
+
+    --version    print the program name and version
+    --flush      copy local metrics rows into a shared recorder database
+    --help       this text
+
+Settings: ~/.config/claude-statusline-rust/config.json, or CSR_* variables.
+See README.md for every line, segment and key.";
+
 fn main() {
-    if std::env::args().skip(1).any(|a| a == "--flush") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{HELP}");
+        return;
+    }
+    if args.iter().any(|a| a == "--flush") {
         flush_main();
         return;
     }

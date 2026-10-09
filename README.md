@@ -193,7 +193,7 @@ The voice segment reads an optional per-session JSON card written by the separat
 
 ## Development
 
-Releases are cut by tag; `RELEASING.md` has the steps and what the workflow publishes.
+Versions follow strict Semantic Versioning, and a major bump is welcome when a better shape is found; `VERSIONING.md` says what the numbers promise. Releases are cut by tag with `just tag X.Y.Z`; `RELEASING.md` has the steps and what the workflow publishes. `CHANGELOG.md` is the record, and a pull request that changes behaviour adds its lines there.
 
 ```
 cargo test

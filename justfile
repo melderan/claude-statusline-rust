@@ -46,6 +46,18 @@ uninstall:
     rm -f {{ install_dir }}/{{ binary_name }}
     @echo "Removed {{ install_dir }}/{{ binary_name }}"
 
+# Suggest the next version from the [Unreleased] changelog section
+next-version:
+    scripts/next-version
+
+# Cut a release: just tag X.Y.Z [--push] (see RELEASING.md)
+tag version *flags:
+    scripts/release {{ version }} {{ flags }}
+
+# Check a release tag the way the release workflow will: just verify-tag vX.Y.Z
+verify-tag tag *flags:
+    scripts/verify-tag {{ tag }} {{ flags }}
+
 # Run tests
 test:
     cargo test
