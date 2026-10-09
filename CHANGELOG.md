@@ -4,6 +4,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-09
+
 ### Added
 
 - First release of the status line as a project other people can install: README, Apache-2.0 licence, prebuilt archives with checksums from a tag-triggered workflow.
