@@ -37,6 +37,14 @@ tag="v$version"
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
+# ── Tools first, so nothing is edited and then abandoned ──
+for tool in git cargo awk; do
+  command -v "$tool" >/dev/null 2>&1 || fail "$tool is not on PATH; nothing was changed"
+done
+if [ "$sign" = "-s" ] && ! git config --get user.signingkey >/dev/null && ! git config --get gpg.format >/dev/null; then
+  fail "no signing key configured (git config user.signingkey); pass --no-sign only for a rehearsal"
+fi
+
 # ── The tree, the branch, the upstream ──
 branch="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$branch" != "main" ] && [ "$allow_branch" -eq 0 ]; then
@@ -119,6 +127,13 @@ if [ "$sign" = "-s" ] && ! git cat-file tag "$tag" | grep -q -- '-----BEGIN .*SI
   fail "tag $tag carries no signature"
 fi
 act "tag $tag (annotated$([ "$sign" = "-s" ] && echo ', signed'))"
+
+# The same checks the release workflow runs, against this branch.
+verify=(scripts/verify-tag "$tag" --local)
+[ "$sign" = "-a" ] && verify+=(--allow-unsigned)
+say "${verify[*]}"
+"${verify[@]}" >/dev/null
+say "verify-tag passed"
 
 if [ "$push" -eq 1 ]; then
   git push origin "$branch"

@@ -4,7 +4,7 @@ Versions follow `VERSIONING.md`: strict Semantic Versioning, one annotated signe
 
 ## Steps
 
-1. Make sure every change since the last release has its lines under `[Unreleased]` in `CHANGELOG.md`. Read them and pick the number: a `Removed` entry, a changed default or any other break means MAJOR; `Added` means MINOR; only `Fixed` means PATCH.
+1. Make sure every change since the last release has its lines under `[Unreleased]` in `CHANGELOG.md`. Read them and pick the number: a `Removed` entry, a changed default or any other break means MAJOR; `Added` means MINOR; only `Fixed` means PATCH. `just next-version` reads the section and suggests a number with its reason; it cannot see whether a `Changed` entry breaks someone, so the reader decides.
 2. On an up-to-date `main` with a clean tree, run:
 
    ```
@@ -20,7 +20,7 @@ Versions follow `VERSIONING.md`: strict Semantic Versioning, one annotated signe
    git push origin vX.Y.Z
    ```
 
-   `just tag X.Y.Z --push` does both at the end of the script instead.
+   `just tag X.Y.Z --push` does both at the end of the script instead. Before pushing, `just verify-tag vX.Y.Z --local` runs the same checks the workflow will run (the script already ran them once).
 
 A release candidate is `just tag X.Y.Z-rc.1`; the workflow marks its GitHub release as a pre-release.
 

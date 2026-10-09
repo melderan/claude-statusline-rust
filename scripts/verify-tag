@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Verify a release tag the way the release workflow does, before or after pushing it.
+# Usage: scripts/verify-tag vX.Y.Z [--local] [--notes FILE] [--allow-unsigned]
+#   --local           the tag's commit must be on the current branch, not on origin/main
+#   --notes FILE      write the tag's changelog section (the release notes) to FILE
+#   --allow-unsigned  accept an annotated tag without a signature (rehearsals only)
+set -euo pipefail
+
+usage() { sed -n '2,6p' "$0" | sed 's/^# //'; exit 2; }
+
+tag=""; local_branch=0; notes=""; allow_unsigned=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local) local_branch=1 ;;
+    --notes) shift; notes="${1:-}"; [ -n "$notes" ] || usage ;;
+    --allow-unsigned) allow_unsigned=1 ;;
+    -h|--help) usage ;;
+    -*) echo "verify-tag: unknown flag $1" >&2; usage ;;
+    *) [ -z "$tag" ] || usage; tag="$1" ;;
+  esac
+  shift
+done
+[ -n "$tag" ] || usage
+
+checks=0
+ok() { checks=$((checks + 1)); printf 'verify-tag: ok   %s\n' "$*"; }
+fail() { printf 'verify-tag: FAIL %s\n' "$*" >&2; exit 1; }
+
+cd "$(git rev-parse --show-toplevel)"
+
+semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+[[ "$tag" =~ $semver ]] || fail "$tag is not vX.Y.Z or vX.Y.Z-rc.N"
+version="${tag#v}"
+ok "$tag is strict semver"
+
+git rev-parse -q --verify "refs/tags/$tag" >/dev/null || fail "tag $tag does not exist here"
+[ "$(git cat-file -t "$tag")" = "tag" ] || fail "$tag is a lightweight tag; releases use annotated, signed tags (git tag -s)"
+ok "$tag is annotated"
+
+if git cat-file tag "$tag" | grep -q -- '-----BEGIN .*SIGNATURE-----'; then
+  ok "$tag is signed"
+elif [ "$allow_unsigned" -eq 1 ]; then
+  ok "$tag is unsigned (allowed for this rehearsal)"
+else
+  fail "$tag carries no signature; releases use annotated, signed tags (git tag -s)"
+fi
+
+commit="$(git rev-parse "${tag}^{commit}")"
+if [ "$local_branch" -eq 1 ]; then
+  git merge-base --is-ancestor "$commit" HEAD || fail "the commit under $tag is not on the current branch"
+  ok "the commit under $tag is on the current branch"
+else
+  git rev-parse -q --verify origin/main >/dev/null || fail "origin/main is unknown here; fetch first"
+  git merge-base --is-ancestor "$commit" origin/main || fail "the commit under $tag is not on main"
+  ok "the commit under $tag is on main"
+fi
+
+# Read the files as they are at the tag, not in the working tree.
+show() { git show "${tag}:$1" 2>/dev/null || fail "$1 is missing at $tag"; }
+cargo_version="$(show Cargo.toml | awk '/^\[/ { in_pkg = ($0 == "[package]") } in_pkg && /^version[[:space:]]*=/ { gsub(/.*=[[:space:]]*"|".*/, ""); print; exit }')"
+[ "$cargo_version" = "$version" ] || fail "Cargo.toml at $tag says ${cargo_version:-nothing}, not $version"
+ok "Cargo.toml says $version"
+
+lock_version="$(show Cargo.lock | awk '/^name = "claude-statusline-rust"$/ { getline; gsub(/version = "|"/, ""); print; exit }')"
+[ "$lock_version" = "$version" ] || fail "Cargo.lock at $tag records ${lock_version:-nothing} for this package, not $version (cargo update --workspace)"
+ok "Cargo.lock says $version"
+
+changelog="$(show CHANGELOG.md)"
+printf '%s\n' "$changelog" | grep -q "^## \[${version}\] - [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" \
+  || fail "CHANGELOG.md at $tag has no '## [$version] - YYYY-MM-DD' heading"
+section="$(printf '%s\n' "$changelog" | awk -v v="$version" '
+  $0 ~ "^## \\[" v "\\]" { on = 1; next }
+  /^## \[/ { on = 0 }
+  on { print }
+' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
+[ -n "$(printf '%s' "$section" | tr -d '[:space:]')" ] || fail "the [$version] changelog section is empty"
+ok "CHANGELOG.md has a dated [$version] section with $(printf '%s\n' "$section" | grep -c '^- ') entry line(s)"
+
+if [ -n "$notes" ]; then
+  mkdir -p "$(dirname "$notes")"
+  printf '%s\n' "$section" > "$notes"
+  ok "release notes written to $notes"
+fi
+printf 'verify-tag: %s checks passed for %s\n' "$checks" "$tag"

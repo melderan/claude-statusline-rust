@@ -44,23 +44,7 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          changed="$(git diff --name-only "$BASE" "$HEAD")"
-          if ! printf '%s\n' "$changed" | grep -qE '^(src/|tests/|Cargo\.toml$)'; then
-            echo "No code change; no changelog entry needed."
-            exit 0
-          fi
-          if ! printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
-            echo "::error::This pull request changes code but not CHANGELOG.md. Add your lines under [Unreleased] (see VERSIONING.md), or add the no-changelog label."
-            exit 1
-          fi
-          added="$(git diff "$BASE" "$HEAD" -- CHANGELOG.md | grep -cE '^\+- ' || true)"
-          if [ "$added" -eq 0 ]; then
-            echo "::error::CHANGELOG.md changed but no entry line (starting with '- ') was added."
-            exit 1
-          fi
-          echo "CHANGELOG.md gained $added entry line(s)."
+        run: scripts/check-changelog "$BASE" "$HEAD"
 
   fmt:
     name: fmt
