@@ -31,7 +31,7 @@ grep "claude-statusline-rust-$T.tar.gz" SHA256SUMS | shasum -a 256 -c -
 tar -xzf "claude-statusline-rust-$T.tar.gz"
 ```
 
-On Linux, `sha256sum -c -` replaces `shasum -a 256 -c -`. The check must print `OK` before you run the binary. Put the extracted `claude-statusline-rust` somewhere stable, such as `~/.local/bin`.
+On Linux, `sha256sum -c -` replaces `shasum -a 256 -c -`. The check must print `OK` before you run the binary. The archive unpacks to a directory named after it, `claude-statusline-rust-<target>/`, holding the binary, this README and the LICENSE. Put the binary somewhere stable, such as `~/.local/bin`.
 
 ### cargo install
 
@@ -96,6 +96,8 @@ ctx 14% (140k/1000k) | last in:117705 out:4 | $1.87 | cache 93% warm 1h, cold in
 - `$1.87`: `cost.total_cost_usd`, shown above one tenth of a cent.
 - `cache 93% warm 1h, cold in 38m (00:36Z)`: from `prompt_cache`. The percentage is `hit_ratio`, `1h` is `ttl`, and the countdown and UTC clock time come from `expires_at`. A cold cache reads `cache cold 93% (+110k to rewarm)`, the number being `recache_tokens_if_cold`. `miss:2 (ttl_expired_1h)` is `misses` and the cause from `last_miss_cause`. Hidden until `caching_observed` is true.
 
+When the context is within 20 percent of the window of the point where Claude Code compacts it on its own, the ctx line adds `compact in 12k` in amber, and `compact!` at or past that point. The hook payload does not announce the compaction point, so it is taken as the window minus `compact_reserve` tokens (default 33000). A negative `compact_reserve` turns the marker off.
+
 ### Residue line
 
 ```
@@ -118,6 +120,20 @@ git: main (3m) * ahead:1 | PR#123 approved
 
 If the directory is not a repository but the payload names a linked worktree (`workspace.git_worktree`), the line shows that name alone.
 
+### Activity line
+
+```
+tools: Bash x4 Read x2 Edit x1 | agents: 1 running, 3 done | todo: 3/7 done, now: Write the tests
+```
+
+Read from the tail of the session transcript named by `transcript_path`: the last 512 KiB only, so the cost stays flat however long the session runs. Each part appears only when it has something to say.
+
+- `tools`: tool calls since your last prompt, by name, most used first, five names then `+N more`. An MCP tool `mcp__server__name` shows as `name`.
+- `agents`: sub-agents launched with the Agent tool. A background agent counts as running until its completion notice arrives, even if it was started several prompts ago; `done` counts those that finished during the current prompt.
+- `todo`: progress of the task list (`TaskCreate` and `TaskUpdate`, or `TodoWrite` in older versions): completed over total, and the first item in progress, cut at 40 characters.
+
+The transcript format is not a documented contract. The shapes the parser relies on are listed, with dates, at the top of `src/activity.rs`; a line it does not recognise is skipped. Hidden with `activity: false` or `CSR_ACTIVITY=0`.
+
 ### 5h and 7d windows
 
 ```
@@ -135,6 +151,14 @@ effort:high | "refactor auth" | voice: narrator (en_US-demo-medium) 2.0x
 
 Joined with ` | `, in this order, each only when present: `effort:<level>` (`effort.level`), `fast` (`fast_mode`), `think:off` (`thinking.enabled` is false), the session name in quotes (`session_name`, cut at 32 characters), `wt:<name>` (`worktree.name`), the voice segment (see Compatibility), `[NORMAL]` (`vim.mode`) and `{name}` (`agent.name`).
 
+## One-line mode
+
+```
+~/code/my-app | Opus 4.6 | CC:2.1.0 | dur:1h02m | ctx 43% (86k/200k) | $1.23 | git: main (3h) *
+```
+
+Set `lines` to `one` (or `CSR_LINES=one`) and every line above is joined into a single row with ` | `, in the same order. When the row is wider than `COLUMNS`, pieces are dropped from the least important up until it fits: the residue numbers first, then the 7d and 5h windows, the activity line, the misc tags, the tail of the ctx line (cache, then `last in/out`, then cost), the tail of the project line (version, memory, always-on size, duration), and the tail of the git line (age, then PR state). The project path and model, the ctx percentage and the branch stay the longest; the project path is never dropped, so on a very narrow terminal it is clipped rather than lost. The default `multi` prints one line per kind of information as shown above.
+
 ## Configuration
 
 Settings come from `~/.config/claude-statusline-rust/config.json`, then environment variables override them. An unreadable file or one that fails to parse means all defaults. Boolean variables accept `1`, `true`, `yes`, `on` (any case); anything else is false.
@@ -149,6 +173,9 @@ Settings come from `~/.config/claude-statusline-rust/config.json`, then environm
 | `cache` | `CSR_CACHE` | `true` | The prompt cache segment. |
 | `extras` | `CSR_EXTRAS` | `true` | Pace, `200k+`, PR state, and the effort, fast, thinking, session and worktree tags. |
 | `voice` | `CSR_VOICE` | `true` | The voice segment. |
+| `activity` | `CSR_ACTIVITY` | `true` | The activity line from the transcript. |
+| `lines` | `CSR_LINES` | `multi` | `multi` or `one`; see One-line mode. Anything else is ignored. |
+| `compact_reserve` | `CSR_COMPACT_RESERVE` | `33000` | Tokens kept free at the compaction point; negative turns the `compact in` marker off. |
 
 ## Metrics database
 
@@ -165,6 +192,8 @@ Set `metrics_db` (or `CSR_METRICS_DB`) to use another file, for example one on a
 The voice segment reads an optional per-session JSON card written by the separate project [claude-code-tts](https://github.com/melderan/claude-code-tts), at `~/.claude-tts/voice.d/<session>.json`. The session is `$CLAUDE_TTS_SESSION` if set, otherwise the project path with every character other than an ASCII letter or digit turned into `-`. Only card schema 1 with a persona is used. It renders as `voice: <persona> (<voice>) <speed>x`, with ` muted` appended when muted. No card means no segment, and nothing else in this program depends on that project.
 
 ## Development
+
+Releases are cut by tag; `RELEASING.md` has the steps and what the workflow publishes.
 
 ```
 cargo test
