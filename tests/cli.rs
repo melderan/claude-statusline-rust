@@ -223,3 +223,42 @@ fn lines_and_compact_env_reach_the_render() {
     assert_eq!(junk, multi, "an unparsable reserve is ignored");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn activity_line_renders_from_the_transcript_and_a_missing_one_costs_nothing() {
+    let dir = fresh_dir("activity");
+    let t = dir.join("session.jsonl");
+    std::fs::write(
+        &t,
+        concat!(
+            r#"{"type":"user","origin":{"kind":"human"},"message":{"content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let with = |path: &str| HOOK.replacen('{', &format!(r#"{{"transcript_path":"{path}","#), 1);
+
+    let (code, out, err) = run(&dir, &[], &[], &with(&t.to_string_lossy()));
+    assert_eq!(code, 0);
+    assert!(out.contains("\ntools: Bash x1"), "{out}");
+    assert_eq!(err, "");
+
+    let (code, hidden, _) = run(
+        &dir,
+        &[("CSR_ACTIVITY", "0")],
+        &[],
+        &with(&t.to_string_lossy()),
+    );
+    assert_eq!(code, 0);
+    assert!(!hidden.contains("tools:"), "{hidden}");
+
+    let missing = dir.join("missing.jsonl");
+    let (code, out, err) = run(&dir, &[], &[], &with(&missing.to_string_lossy()));
+    assert_eq!(code, 0, "a missing transcript never fails the render");
+    assert!(out.contains("ctx "), "{out}");
+    assert!(!out.contains("tools:"), "{out}");
+    assert_eq!(err, "");
+    let _ = std::fs::remove_dir_all(&dir);
+}

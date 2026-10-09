@@ -1907,6 +1907,7 @@ fn fixture_env() -> Env {
         residue: Vec::new(),
         git: None,
         voice: None,
+        activity: None,
         now: 2_000_000,
     }
 }
@@ -2030,7 +2031,13 @@ fn one_line_at_width_1000_prints_every_row_in_render_order() {
     let cfg = one_line_cfg();
     let lines = fixture_lines(&cfg, &env);
     let out = assemble(&lines, &cfg, 1000);
-    let rows: Vec<String> = lines.in_order().iter().map(|r| r.text()).collect();
+    // Every non-empty row; the fixture has no activity row.
+    let rows: Vec<String> = lines
+        .in_order()
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| r.text())
+        .collect();
     assert_eq!(out, rows.join(" | "), "plain separator when colour is off");
     assert!(!out.contains('\n'));
 }
@@ -2344,4 +2351,329 @@ fn ctx_row_shows_the_compact_marker_after_the_size() {
         "{}",
         lines.ctx.text()
     );
+}
+
+// ── activity line (transcript JSONL shapes documented in activity.rs) ──
+
+fn human(text: &str) -> String {
+    serde_json::json!({"type":"user","origin":{"kind":"human"},"message":{"role":"user","content":text}})
+        .to_string()
+}
+
+fn tool_use(id: &str, name: &str, input: serde_json::Value) -> String {
+    serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+        {"type":"tool_use","id":id,"name":name,"input":input}]}})
+    .to_string()
+}
+
+fn tool_result(id: &str, extra: serde_json::Value) -> String {
+    serde_json::json!({"type":"user","message":{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":id,"content":"ok"}]},"toolUseResult":extra})
+    .to_string()
+}
+
+fn jsonl(lines: &[String]) -> String {
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+#[test]
+fn activity_counts_this_turns_tools_most_used_first() {
+    let mut lines = vec![
+        human("earlier prompt"),
+        tool_use("t0", "Write", serde_json::json!({})),
+        tool_result("t0", serde_json::json!({})),
+        human("this prompt"),
+    ];
+    for (i, name) in ["Bash", "Read", "Bash", "Edit", "Bash", "Read", "Bash"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("t{}", i + 1);
+        lines.push(tool_use(&id, name, serde_json::json!({"command":"x"})));
+        lines.push(tool_result(&id, serde_json::json!({"stdout":"y"})));
+    }
+    // one response split over two lines repeats nothing, but a repeated id counts once
+    lines.push(tool_use("t1", "Bash", serde_json::json!({})));
+    let a = scan_activity(&jsonl(&lines));
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: Bash x4 Read x2 Edit x1")
+    );
+
+    // past five names: +N more, ties sorted by name
+    let mut lines = vec![human("go")];
+    for (i, name) in ["A", "B", "C", "D", "E", "F", "G", "A"].iter().enumerate() {
+        lines.push(tool_use(&format!("u{i}"), name, serde_json::json!({})));
+    }
+    let a = scan_activity(&jsonl(&lines));
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: A x2 B x1 C x1 D x1 E x1 +2 more")
+    );
+}
+
+#[test]
+fn activity_agents_running_until_their_result_or_completion_notice() {
+    let notice = |id: &str| {
+        serde_json::json!({"type":"user","origin":{"kind":"task-notification"},
+            "message":{"role":"user","content":format!(
+                "<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>{id}</tool-use-id>\n<status>completed</status>\n</task-notification>")}})
+        .to_string()
+    };
+    let lines = vec![
+        human("fan out"),
+        // finished in the foreground
+        tool_use("a1", "Agent", serde_json::json!({"description":"one"})),
+        tool_result("a1", serde_json::json!({"status":"completed"})),
+        // background launch, then its completion notice
+        tool_use("a2", "Agent", serde_json::json!({"description":"two"})),
+        tool_result(
+            "a2",
+            serde_json::json!({"status":"async_launched","agentId":"x"}),
+        ),
+        notice("a2"),
+        // background launch, still running
+        tool_use("a3", "Agent", serde_json::json!({"description":"three"})),
+        tool_result("a3", serde_json::json!({"status":"async_launched"})),
+        // older tool name, no result yet
+        tool_use("a4", "Task", serde_json::json!({"description":"four"})),
+    ];
+    let a = scan_activity(&jsonl(&lines));
+    assert_eq!((a.agents_running, a.agents_done), (2, 2));
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: Agent x3 Task x1 | agents: 2 running, 2 done")
+    );
+    // the notice is not a prompt: the turn did not restart at it
+    assert_eq!(a.tools.iter().map(|t| t.1).sum::<usize>(), 4);
+
+    let only_running = scan_activity(&jsonl(&lines[..2]));
+    assert_eq!(
+        activity_line(&only_running, &plain()).as_deref(),
+        Some("tools: Agent x1 | agents: 1 running")
+    );
+    let only_done = scan_activity(&jsonl(&lines[..3]));
+    assert_eq!(
+        activity_line(&only_done, &plain()).as_deref(),
+        Some("tools: Agent x1 | agents: 1 done")
+    );
+}
+
+#[test]
+fn activity_todo_comes_from_the_last_todowrite_across_turns() {
+    let todos = |items: &[(&str, &str)]| {
+        serde_json::json!({"todos": items.iter().map(|(c, s)| serde_json::json!({
+            "content": c, "status": s, "activeForm": c})).collect::<Vec<_>>()})
+    };
+    let lines = vec![
+        human("plan"),
+        tool_use(
+            "w1",
+            "TodoWrite",
+            todos(&[("old", "in_progress"), ("older", "pending")]),
+        ),
+        tool_use(
+            "w2",
+            "TodoWrite",
+            todos(&[
+                ("Read the code", "completed"),
+                (
+                    "Write the activity line and every test it needs",
+                    "in_progress",
+                ),
+                ("Measure", "pending"),
+            ]),
+        ),
+        tool_result("w2", serde_json::json!({})),
+        human("next turn, no tools yet"),
+    ];
+    let a = scan_activity(&jsonl(&lines));
+    assert!(a.tools.is_empty(), "the new turn has no tool calls");
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("todo: 1/3 done, now: Write the activity line and every test\u{2026}")
+    );
+
+    // nothing in progress: no "now"
+    let lines = vec![
+        human("x"),
+        tool_use(
+            "w3",
+            "TodoWrite",
+            todos(&[("a", "completed"), ("b", "pending"), ("c", "pending")]),
+        ),
+    ];
+    let a = scan_activity(&jsonl(&lines));
+    assert_eq!(
+        a.todo,
+        Some(Todo {
+            done: 1,
+            total: 3,
+            now: None
+        })
+    );
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: TodoWrite x1 | todo: 1/3 done")
+    );
+
+    // an emptied list shows no todo part
+    let lines = vec![human("x"), tool_use("w4", "TodoWrite", todos(&[]))];
+    assert_eq!(scan_activity(&jsonl(&lines)).todo, None);
+}
+
+#[test]
+fn activity_without_a_prompt_in_the_tail_counts_from_the_tail_start() {
+    let lines = vec![
+        tool_result("before", serde_json::json!({})),
+        tool_use("t1", "Read", serde_json::json!({})),
+        tool_use("t2", "Read", serde_json::json!({})),
+        // injected messages are not prompts
+        serde_json::json!({"type":"user","origin":{"kind":"plugin"},"message":{"content":"mail"}})
+            .to_string(),
+        serde_json::json!({"type":"user","isMeta":true,"message":{"content":"meta"}}).to_string(),
+        tool_use("t3", "Grep", serde_json::json!({})),
+    ];
+    let a = scan_activity(&jsonl(&lines));
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: Read x2 Grep x1")
+    );
+}
+
+#[test]
+fn activity_skips_a_corrupt_line_and_reads_older_prompt_shapes() {
+    let text = format!(
+        "{}\n{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\"\n{}\nnot json at all\n{}\n{}\n",
+        // an older line without "origin": a plain string prompt
+        r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+        tool_use("t1", "Bash", serde_json::json!({})),
+        r#"{"type":"assistant","message":{"content":"a shape nobody expects"},"toolUseResult":[1,2]}"#,
+        tool_use("t2", "Bash", serde_json::json!({})),
+    );
+    let a = scan_activity(&text);
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: Bash x2")
+    );
+    // an old-style prompt with image blocks also starts a turn
+    let text = format!(
+        "{}\n{}\n",
+        tool_use("t0", "Bash", serde_json::json!({})),
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"look"},{"type":"image"}]}}"#
+    );
+    assert_eq!(scan_activity(&text), Activity::default());
+}
+
+#[test]
+fn activity_line_colours_and_hides_when_empty() {
+    assert_eq!(activity_line(&Activity::default(), &plain()), None);
+    assert_eq!(scan_activity(""), Activity::default());
+    let a = Activity {
+        tools: vec![("Bash".into(), 1)],
+        agents_running: 1,
+        agents_done: 0,
+        todo: None,
+    };
+    let coloured = activity_line(&a, &Config::default()).unwrap();
+    assert_eq!(
+        coloured,
+        format!("tools: Bash x1 {DIM}|{RESET} agents: {AMBER}1 running{RESET}")
+    );
+}
+
+#[test]
+fn activity_reads_only_the_tail_of_the_file() {
+    let dir = fresh_dir("activity");
+    let path = dir.join("t.jsonl");
+    let p = path.to_string_lossy().to_string();
+
+    // empty file: no line
+    std::fs::write(&path, "").unwrap();
+    assert_eq!(read_tail(&p, ACTIVITY_TAIL).as_deref(), Some(""));
+    assert_eq!(activity_from_path(&p, &plain()), None);
+
+    // shorter than the window: read whole, the first line kept
+    let text = jsonl(&[human("hi"), tool_use("t1", "Read", serde_json::json!({}))]);
+    std::fs::write(&path, &text).unwrap();
+    assert_eq!(read_tail(&p, ACTIVITY_TAIL).as_deref(), Some(text.as_str()));
+    assert_eq!(
+        activity_from_path(&p, &plain()).as_deref(),
+        Some("tools: Read x1")
+    );
+
+    // longer than the window: the cut first line is dropped
+    let last = tool_use("t2", "Edit", serde_json::json!({}));
+    let text = jsonl(&[tool_use("t1", "Read", serde_json::json!({})), last.clone()]);
+    std::fs::write(&path, &text).unwrap();
+    let window = last.len() as u64 + 5;
+    assert_eq!(read_tail(&p, window), Some(format!("{last}\n")));
+    // a window inside one line holds no whole line
+    assert_eq!(read_tail(&p, 3).as_deref(), Some(""));
+
+    // missing file: None, no panic
+    assert_eq!(
+        read_tail(&dir.join("gone.jsonl").to_string_lossy(), 64),
+        None
+    );
+    assert_eq!(activity_from_path("/nonexistent/t.jsonl", &plain()), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn activity_config_defaults_on() {
+    assert!(Config::default().activity);
+    let off: Config = serde_json::from_str(r#"{"activity":false}"#).unwrap();
+    assert!(
+        !off.activity && off.voice,
+        "one key, the rest keep defaults"
+    );
+}
+
+/// Times the activity line on a generated 50 MB transcript. Not run by
+/// default: `cargo test --release -- --ignored activity_cost --nocapture`.
+#[test]
+#[ignore]
+fn activity_cost_on_a_large_transcript() {
+    let dir = fresh_dir("activity-cost");
+    let path = dir.join("big.jsonl");
+    let mut text = String::with_capacity(51 * 1024 * 1024);
+    let output = "x".repeat(4000);
+    let mut i = 0;
+    while text.len() < 50 * 1024 * 1024 {
+        if i % 40 == 0 {
+            text.push_str(&human("next prompt"));
+            text.push('\n');
+        }
+        let id = format!("toolu_{i}");
+        text.push_str(&tool_use(
+            &id,
+            "Bash",
+            serde_json::json!({"command":"ls -la"}),
+        ));
+        text.push('\n');
+        text.push_str(&tool_result(&id, serde_json::json!({"stdout": output})));
+        text.push('\n');
+        i += 1;
+    }
+    std::fs::write(&path, &text).unwrap();
+    let p = path.to_string_lossy().to_string();
+    let runs = 50;
+    let t = std::time::Instant::now();
+    let mut line = None;
+    for _ in 0..runs {
+        line = activity_from_path(&p, &plain());
+    }
+    let per = t.elapsed() / runs;
+    eprintln!(
+        "activity on {} MB: {:?} per render, {:?}",
+        text.len() / (1024 * 1024),
+        per,
+        line
+    );
+    assert!(line.is_some());
+    assert!(per < std::time::Duration::from_millis(5), "{per:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

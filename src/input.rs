@@ -39,6 +39,9 @@ pub(crate) struct Input {
     pub(crate) rate_limits: Option<RateLimits>,
     pub(crate) version: Option<String>,
     pub(crate) session_id: Option<String>,
+    /// Path to the session transcript (JSONL), read by the activity line.
+    #[serde(default, deserialize_with = "lenient")]
+    pub(crate) transcript_path: Option<String>,
     /// UUID of the user prompt being processed; one value per user turn.
     pub(crate) prompt_id: Option<String>,
     /// The most recent API response crossed 200k tokens (input, cache and

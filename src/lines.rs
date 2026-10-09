@@ -39,22 +39,24 @@ pub(crate) mod rank {
     pub(crate) const RESIDUE: u8 = 1;
     pub(crate) const SEVEN_DAY: u8 = 2;
     pub(crate) const FIVE_HOUR: u8 = 3;
-    pub(crate) const MISC: u8 = 4;
+    /// The activity row (tools, agents, todo) goes before the misc tags.
+    pub(crate) const ACTIVITY: u8 = 4;
+    pub(crate) const MISC: u8 = 5;
     /// ctx tail: the cache segment, then last in/out, then the cost.
-    pub(crate) const CTX_CACHE: u8 = 5;
-    pub(crate) const CTX_LAST: u8 = 6;
-    pub(crate) const CTX_COST: u8 = 7;
+    pub(crate) const CTX_CACHE: u8 = 6;
+    pub(crate) const CTX_LAST: u8 = 7;
+    pub(crate) const CTX_COST: u8 = 8;
     /// project tail: CC version, memory sizes, always-on size, duration.
-    pub(crate) const PROJECT_CC: u8 = 8;
-    pub(crate) const PROJECT_MEM: u8 = 9;
-    pub(crate) const PROJECT_ON: u8 = 10;
-    pub(crate) const PROJECT_DUR: u8 = 11;
+    pub(crate) const PROJECT_CC: u8 = 9;
+    pub(crate) const PROJECT_MEM: u8 = 10;
+    pub(crate) const PROJECT_ON: u8 = 11;
+    pub(crate) const PROJECT_DUR: u8 = 12;
     /// git tail: the age, then the PR tag.
-    pub(crate) const GIT_AGE: u8 = 12;
-    pub(crate) const GIT_PR: u8 = 13;
+    pub(crate) const GIT_AGE: u8 = 13;
+    pub(crate) const GIT_PR: u8 = 14;
     /// Heads, last to go: git, then ctx. The project head is KEEP.
-    pub(crate) const GIT_HEAD: u8 = 14;
-    pub(crate) const CTX_HEAD: u8 = 15;
+    pub(crate) const GIT_HEAD: u8 = 15;
+    pub(crate) const CTX_HEAD: u8 = 16;
 }
 
 /// A run of text inside a row, with the place it takes in the drop order.
@@ -114,18 +116,21 @@ pub(crate) struct Lines {
     pub(crate) ctx: Row,
     pub(crate) residue: Row,
     pub(crate) git: Row,
+    /// Tools, agents and todo progress read from the transcript.
+    pub(crate) activity: Row,
     pub(crate) five_hour: Row,
     pub(crate) seven_day: Row,
     pub(crate) misc: Row,
 }
 
 impl Lines {
-    pub(crate) fn in_order(&self) -> [&Row; 7] {
+    pub(crate) fn in_order(&self) -> [&Row; 8] {
         [
             &self.project,
             &self.ctx,
             &self.residue,
             &self.git,
+            &self.activity,
             &self.five_hour,
             &self.seven_day,
             &self.misc,
@@ -147,6 +152,8 @@ pub(crate) struct Env {
     pub(crate) git: Option<GitInfo>,
     /// The voice segment, already read from the voice card.
     pub(crate) voice: Option<String>,
+    /// The activity line, already read from the transcript tail.
+    pub(crate) activity: Option<String>,
     pub(crate) now: i64,
 }
 
@@ -239,6 +246,9 @@ pub(crate) fn build_lines(data: &Input, cfg: &Config, env: &Env) -> Lines {
     }
 
     lines.git = git_row(data, cfg, env);
+    if let Some(a) = &env.activity {
+        lines.activity = Row::whole(a.clone(), rank::ACTIVITY);
+    }
     lines.five_hour = five_hour_row(data, cfg, env.now);
     lines.seven_day = seven_day_row(data, cfg, env.now);
     lines.misc = Row::whole(misc_text(data, cfg, env), rank::MISC);

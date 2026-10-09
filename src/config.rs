@@ -65,6 +65,11 @@ pub(crate) struct Config {
     /// that is not a whole number is ignored.
     #[serde(default, deserialize_with = "lenient")]
     pub(crate) compact_reserve: Option<i64>,
+    /// Activity line from the session transcript: tool calls this turn,
+    /// sub-agents running and done, todo progress. On by default;
+    /// `activity: false` or `CSR_ACTIVITY=0` hides it.
+    #[serde(default = "default_true")]
+    pub(crate) activity: bool,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -106,6 +111,7 @@ impl Default for Config {
             voice: true,
             lines: None,
             compact_reserve: None,
+            activity: true,
         }
     }
 }
@@ -151,6 +157,9 @@ impl Config {
             && let Ok(n) = v.trim().parse::<i64>()
         {
             cfg.compact_reserve = Some(n);
+        }
+        if let Ok(v) = std::env::var("CSR_ACTIVITY") {
+            cfg.activity = truthy(&v);
         }
         cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);

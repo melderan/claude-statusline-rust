@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 use std::io::Read;
 
+mod activity;
 mod config;
 mod extras;
 mod flush;
@@ -16,6 +17,7 @@ mod render;
 mod tests;
 mod voice;
 
+use activity::*;
 use config::*;
 use extras::*;
 use flush::*;
@@ -132,6 +134,16 @@ fn main() {
         None
     };
 
+    // Activity: tools, agents and todo progress of this session, from the
+    // tail of the transcript. Any trouble reading it means no row.
+    let activity = if cfg.activity {
+        data.transcript_path
+            .as_deref()
+            .and_then(|p| activity_from_path(p, &cfg))
+    } else {
+        None
+    };
+
     let env = Env {
         mode,
         bar_width,
@@ -140,6 +152,7 @@ fn main() {
         residue,
         git,
         voice,
+        activity,
         now: now_epoch(),
     };
     let lines = build_lines(&data, &cfg, &env);
