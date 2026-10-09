@@ -52,6 +52,12 @@ pub(crate) struct Config {
     /// `voice: false` or `CSR_VOICE=0` hides it.
     #[serde(default = "default_true")]
     pub(crate) voice: bool,
+    /// `"multi"` (the default) prints one row per kind of information;
+    /// `"one"` joins them into a single row, dropping the least important
+    /// pieces to fit the terminal width. `CSR_LINES=one|multi` overrides.
+    /// Anything else is ignored rather than failing the whole config.
+    #[serde(default, deserialize_with = "lenient")]
+    pub(crate) lines: Option<LineMode>,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -91,6 +97,7 @@ impl Default for Config {
             cache: true,
             extras: true,
             voice: true,
+            lines: None,
         }
     }
 }
@@ -127,9 +134,18 @@ impl Config {
         if let Ok(v) = std::env::var("CSR_VOICE") {
             cfg.voice = truthy(&v);
         }
+        if let Ok(v) = std::env::var("CSR_LINES")
+            && let Some(mode) = LineMode::parse(&v)
+        {
+            cfg.lines = Some(mode);
+        }
         cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);
         cfg
+    }
+
+    pub(crate) fn line_mode(&self) -> LineMode {
+        self.lines.unwrap_or_default()
     }
 
     /// `CSR_METRICS_DB` overrides `metrics_db` from the file; a blank value is

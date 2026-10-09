@@ -1840,3 +1840,325 @@ fn ahead_behind_counts_across_a_merge() {
     assert_eq!(ahead_behind(&repo), Some((1, 2)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── lines: one-line mode and the row layout ──
+
+#[test]
+fn strip_ansi_removes_escapes_and_keeps_text() {
+    assert_eq!(strip_ansi("plain"), "plain");
+    assert_eq!(strip_ansi("\x1b[0m"), "");
+    assert_eq!(
+        strip_ansi("a \x1b[38;2;100;116;139m|\x1b[0m b"),
+        "a | b",
+        "24-bit colour pairs vanish, the text between stays"
+    );
+    assert_eq!(strip_ansi("\x1b[1;31mred\x1b[0m\x1b[0m!"), "red!");
+    assert_eq!(strip_ansi("\u{26C1}\u{2192} ok"), "\u{26C1}\u{2192} ok");
+    assert_eq!(strip_ansi("tail\x1b"), "tail", "a lone ESC is dropped");
+    assert_eq!(
+        strip_ansi("x\x1b[38;2;1"),
+        "x",
+        "an unterminated sequence never panics"
+    );
+    assert_eq!(strip_ansi("\x1bQ?"), "Q?", "only CSI is skipped");
+    assert_eq!(visible_len("\x1b[38;2;1;2;3mab\x1b[0m\u{26C1}"), 3);
+}
+
+#[test]
+fn line_mode_parses_leniently() {
+    assert_eq!(LineMode::parse("one"), Some(LineMode::One));
+    assert_eq!(LineMode::parse(" ONE "), Some(LineMode::One));
+    assert_eq!(LineMode::parse("Multi"), Some(LineMode::Multi));
+    assert_eq!(LineMode::parse("two"), None);
+    assert_eq!(LineMode::parse(""), None);
+    let d = Config::default();
+    assert_eq!(d.line_mode(), LineMode::Multi, "multi is the default");
+}
+
+#[test]
+fn lines_config_never_breaks_the_rest() {
+    let cfg: Config = serde_json::from_str(r#"{"bar": true, "lines": "one"}"#).unwrap();
+    assert!(cfg.bar);
+    assert_eq!(cfg.line_mode(), LineMode::One);
+    let cfg: Config = serde_json::from_str(r#"{"bar": true, "lines": "bogus"}"#).unwrap();
+    assert!(cfg.bar, "a bad value costs only itself");
+    assert_eq!(cfg.line_mode(), LineMode::Multi);
+    let cfg: Config = serde_json::from_str(r#"{"lines": 3}"#).unwrap();
+    assert_eq!(cfg.line_mode(), LineMode::Multi);
+}
+
+/// A hook payload that fills every row. The rate-limit windows and the
+/// cache expiry are long past, so the output does not move with the clock.
+const FIXTURE: &str = r#"{"model":{"display_name":"Claude Opus 4.6"},"workspace":{"project_dir":"/srv/app","current_dir":"/srv/app/crates/core","git_worktree":"fix-auth"},"context_window":{"total_input_tokens":84210,"total_output_tokens":1900,"context_window_size":200000,"used_percentage":43,"current_usage":{"input_tokens":10,"output_tokens":900,"cache_read_input_tokens":60000,"cache_creation_input_tokens":3090}},"cost":{"total_cost_usd":1.234,"total_duration_ms":3725000},"version":"2.1.0","exceeds_200k_tokens":false,"effort":{"level":"high"},"vim":{"mode":"NORMAL"},"agent":{"name":"reviewer"},"pr":{"number":7,"review_state":"approved"},"prompt_cache":{"warm":true,"caching_observed":true,"ttl":"1h","expires_at":1000100,"misses":0,"hit_ratio":0.97},"rate_limits":{"five_hour":{"used_percentage":62.5,"resets_at":1000000},"seven_day":{"used_percentage":41.2,"resets_at":1000000}}}"#;
+
+fn fixture_env() -> Env {
+    Env {
+        mode: Mode::Standard,
+        bar_width: 16,
+        memory: (0, 0),
+        on_chars: 0,
+        residue: Vec::new(),
+        git: None,
+        voice: None,
+        now: 2_000_000,
+    }
+}
+
+fn fixture_lines(cfg: &Config, env: &Env) -> Lines {
+    let data: Input = serde_json::from_str(FIXTURE).unwrap();
+    build_lines(&data, cfg, env)
+}
+
+fn one_line_cfg() -> Config {
+    Config {
+        lines: Some(LineMode::One),
+        ..plain()
+    }
+}
+
+/// What the single-row-per-kind layout printed before the rows were built
+/// separately, captured from that version on this payload.
+const MULTI_GOLDEN_PLAIN: &str = "/srv/app | cd:crates/core | Opus 4.6 | CC:2.1.0 | dur:1h02m\nctx 43% (86k/200k) | last in:84210 out:1900 | $1.23 | cache 97% warm 1h, cold now (13:48Z)\ngit: fix-auth\n5h window: 62% used !, resets now @ Mon Jan 12 13:46 UTC pace 0.6x\n7d window: 41% used, resets now @ Mon Jan 12 13:46 UTC pace 0.4x\neffort:high | [NORMAL] | {reviewer}";
+
+const MULTI_GOLDEN_COLOR: &str = "/srv/app \x1b[38;2;100;116;139m|\x1b[0m cd:crates/core | Opus 4.6 \x1b[38;2;100;116;139m|\x1b[0m CC:2.1.0 \x1b[38;2;100;116;139m|\x1b[0m dur:1h02m\nctx \x1b[38;2;250;204;21m43%\x1b[0m (86k/200k) \x1b[38;2;100;116;139m|\x1b[0m last in:84210 out:1900 \x1b[38;2;100;116;139m|\x1b[0m $1.23 \x1b[38;2;100;116;139m|\x1b[0m cache \x1b[38;2;74;222;128m97%\x1b[0m \x1b[38;2;74;222;128mwarm\x1b[0m 1h, cold now (13:48Z)\ngit: fix-auth\n5h window: 62% used !, resets now @ Mon Jan 12 13:46 UTC \x1b[38;2;74;222;128mpace 0.6x\x1b[0m\n7d window: 41% used, resets now @ Mon Jan 12 13:46 UTC \x1b[38;2;74;222;128mpace 0.4x\x1b[0m\neffort:high | [NORMAL] | {reviewer}";
+
+#[test]
+fn default_multi_line_output_is_byte_identical_to_before_the_split() {
+    let env = fixture_env();
+    let cfg = plain();
+    assert_eq!(cfg.line_mode(), LineMode::Multi);
+    let lines = fixture_lines(&cfg, &env);
+    assert_eq!(assemble(&lines, &cfg, 100), MULTI_GOLDEN_PLAIN);
+    assert_eq!(
+        assemble(&lines, &cfg, 10),
+        MULTI_GOLDEN_PLAIN,
+        "multi never looks at the width"
+    );
+    let colored = Config::default();
+    let lines = fixture_lines(&colored, &env);
+    assert_eq!(assemble(&lines, &colored, 100), MULTI_GOLDEN_COLOR);
+}
+
+#[test]
+fn multi_line_without_a_window_size_keeps_cost_on_the_project_row() {
+    let mut data: Input = serde_json::from_str(FIXTURE).unwrap();
+    data.context_window = None;
+    let cfg = plain();
+    let lines = build_lines(&data, &cfg, &fixture_env());
+    assert_eq!(lines.ctx, "");
+    assert!(
+        lines
+            .project
+            .ends_with(" | $1.23 | cache 97% warm 1h, cold now (13:48Z)"),
+        "{}",
+        lines.project
+    );
+    assert!(!assemble(&lines, &cfg, 100).contains("ctx "));
+}
+
+#[test]
+fn multi_line_without_a_project_row_starts_with_a_blank_line() {
+    let lines = Lines {
+        ctx: "ctx 1%".into(),
+        misc: "m".into(),
+        ..Lines::default()
+    };
+    assert_eq!(assemble(&lines, &plain(), 80), "\nctx 1%\nm");
+    assert_eq!(assemble(&Lines::default(), &plain(), 80), "");
+}
+
+#[test]
+fn rows_fill_from_the_environment() {
+    let env = Env {
+        memory: (25_363, 4_000),
+        on_chars: 21_000,
+        residue: vec![74_000, 3_100],
+        git: Some(GitInfo {
+            branch: "main".into(),
+            age_secs: None,
+            ahead: 2,
+            behind: 0,
+            dirty: true,
+        }),
+        voice: Some("voice: amy 2.0x".into()),
+        ..fixture_env()
+    };
+    let lines = fixture_lines(&plain(), &env);
+    assert!(
+        lines.project.ends_with("mem:25KB+4KB | on:21kch"),
+        "{}",
+        lines.project
+    );
+    assert_eq!(lines.residue, "res: +74k +3.1k");
+    assert_eq!(lines.git, "git: main * ahead:2 | PR#7 approved");
+    assert_eq!(
+        lines.misc,
+        "effort:high | voice: amy 2.0x | [NORMAL] | {reviewer}"
+    );
+    let off = Config {
+        voice: false,
+        ..plain()
+    };
+    assert!(!fixture_lines(&off, &env).misc.contains("voice"));
+}
+
+#[test]
+fn one_line_at_width_200_keeps_what_fits_and_drops_the_least_important() {
+    let env = Env {
+        residue: vec![74_000],
+        ..fixture_env()
+    };
+    let cfg = one_line_cfg();
+    let lines = fixture_lines(&cfg, &env);
+    let out = assemble(&lines, &cfg, 200);
+    assert!(!out.contains('\n'));
+    assert!(visible_len(&out) <= 200, "{} wide", visible_len(&out));
+    // Row widths: project 59, ctx 90, git 13, misc 35, five-hour 66. Misc
+    // would make 206, so it goes, and everything below it with it.
+    assert_eq!(
+        out,
+        "/srv/app | cd:crates/core | Opus 4.6 | CC:2.1.0 | dur:1h02m | ctx 43% (86k/200k) | last in:84210 out:1900 | $1.23 | cache 97% warm 1h, cold now (13:48Z) | git: fix-auth"
+    );
+    assert_eq!(visible_len(&out), 168);
+    // Ten columns more and the misc row fits; the windows are still below it.
+    let out = assemble(&lines, &cfg, 210);
+    assert!(out.ends_with(" | git: fix-auth | effort:high | [NORMAL] | {reviewer}"));
+    assert!(!out.contains("res:") && !out.contains("window"), "{out}");
+}
+
+#[test]
+fn one_line_everything_fits_when_the_terminal_is_wide_enough() {
+    let env = Env {
+        residue: vec![74_000],
+        ..fixture_env()
+    };
+    let cfg = one_line_cfg();
+    let lines = fixture_lines(&cfg, &env);
+    let out = assemble(&lines, &cfg, 1000);
+    let rows = [
+        &lines.project,
+        &lines.ctx,
+        &lines.residue,
+        &lines.git,
+        &lines.five_hour,
+        &lines.seven_day,
+        &lines.misc,
+    ];
+    assert_eq!(
+        out,
+        rows.iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(" | "),
+        "render order, plain separator when colour is off"
+    );
+}
+
+#[test]
+fn one_line_at_width_80_keeps_only_the_project_row_here() {
+    let cfg = one_line_cfg();
+    let lines = fixture_lines(&cfg, &fixture_env());
+    // The project row is 59 columns and ctx 90: the pair needs 152.
+    let out = assemble(&lines, &cfg, 80);
+    assert_eq!(
+        out,
+        "/srv/app | cd:crates/core | Opus 4.6 | CC:2.1.0 | dur:1h02m"
+    );
+    assert!(visible_len(&out) <= 80);
+    let out = assemble(&lines, &cfg, 151);
+    assert!(!out.contains("ctx 43%"), "{out}");
+    let out = assemble(&lines, &cfg, 152);
+    assert!(out.ends_with("(13:48Z)") && !out.contains("git:"), "{out}");
+    assert_eq!(visible_len(&out), 152);
+    let out = assemble(&lines, &cfg, 170);
+    assert!(out.ends_with(" | git: fix-auth"), "{out}");
+}
+
+#[test]
+fn one_line_at_width_40_never_goes_blank() {
+    let cfg = one_line_cfg();
+    let lines = fixture_lines(&cfg, &fixture_env());
+    let out = assemble(&lines, &cfg, 40);
+    assert_eq!(
+        out, lines.project,
+        "the project row survives even when it alone is too wide"
+    );
+    // With no project row, the next row up takes its place.
+    let no_project = Lines {
+        project: String::new(),
+        ..fixture_lines(&cfg, &fixture_env())
+    };
+    let out = assemble(&no_project, &cfg, 40);
+    assert!(out.starts_with("ctx 43%"), "{out}");
+    assert!(!out.contains(" | git"), "{out}");
+    assert_eq!(assemble(&Lines::default(), &cfg, 40), "");
+}
+
+#[test]
+fn one_line_drops_by_priority_and_counts_separators() {
+    let lines = Lines {
+        project: "P".repeat(10),
+        ctx: "C".repeat(10),
+        residue: "R".repeat(10),
+        git: "G".repeat(10),
+        five_hour: "F".repeat(10),
+        seven_day: "S".repeat(10),
+        misc: "M".repeat(10),
+    };
+    let cfg = one_line_cfg();
+    let sep = " | ";
+    let show = |w: usize| assemble(&lines, &cfg, w);
+    // N rows of 10 take 10N + 3(N-1) columns: 88 for seven, then 75, 62,
+    // 49, 36, 23, 10.
+    assert_eq!(visible_len(&show(88)), 88);
+    assert!(show(88).contains('R'));
+    // One short: residue goes. Then seven-day, five-hour, misc, git, ctx.
+    assert!(!show(87).contains('R') && show(87).contains('S'));
+    assert!(!show(74).contains('S') && show(74).contains('F'));
+    assert!(!show(61).contains('F') && show(61).contains('M'));
+    assert!(!show(48).contains('M') && show(48).contains('G'));
+    assert!(!show(35).contains('G') && show(35).contains('C'));
+    assert_eq!(
+        show(23),
+        format!("{}{}{}", "P".repeat(10), sep, "C".repeat(10))
+    );
+    // Project last, and never dropped.
+    assert_eq!(show(22), "P".repeat(10));
+    assert_eq!(show(0), "P".repeat(10));
+}
+
+#[test]
+fn one_line_separator_is_dim_when_colour_is_on() {
+    let lines = Lines {
+        project: "a".into(),
+        ctx: "b".into(),
+        ..Lines::default()
+    };
+    let cfg = Config {
+        lines: Some(LineMode::One),
+        ..Config::default()
+    };
+    assert_eq!(
+        assemble(&lines, &cfg, 80),
+        format!("a {}|{} b", DIM, RESET),
+        "the same DIM + reset pair the rows use inside themselves"
+    );
+    assert_eq!(visible_len(&assemble(&lines, &cfg, 80)), 5);
+}
+
+#[test]
+fn one_line_width_ignores_colour_codes() {
+    let env = fixture_env();
+    let cfg = Config {
+        lines: Some(LineMode::One),
+        ..Config::default()
+    };
+    let lines = fixture_lines(&cfg, &env);
+    let wide = assemble(&lines, &cfg, 160);
+    let plain_cfg = one_line_cfg();
+    let plain_wide = assemble(&fixture_lines(&plain_cfg, &env), &plain_cfg, 160);
+    assert_eq!(
+        strip_ansi(&wide),
+        plain_wide,
+        "colour on or off, the same pieces survive the same width"
+    );}

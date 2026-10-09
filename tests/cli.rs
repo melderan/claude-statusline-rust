@@ -193,3 +193,27 @@ fn first_renders_of_a_new_file_all_write() {
         assert_eq!(rows, 8, "round {round}: every first render writes its row");
     }
 }
+
+#[test]
+fn lines_env_reaches_the_render() {
+    let dir = fresh_dir("linesenv");
+    let (_, multi, _) = run(&dir, &[], &[], HOOK);
+    assert_eq!(multi.lines().count(), 2, "{multi:?}");
+    assert!(
+        !multi.contains("compact"),
+        "far from the threshold: {multi}"
+    );
+
+    let (code, one, _) = run(&dir, &[("CSR_LINES", "one")], &[], HOOK);
+    assert_eq!(code, 0);
+    assert_eq!(one.lines().count(), 1, "{one:?}");
+    assert!(one.starts_with("/x | Fable | ctx "), "{one}");
+
+    let (_, narrow, _) = run(&dir, &[("CSR_LINES", "one"), ("COLUMNS", "20")], &[], HOOK);
+    assert_eq!(narrow, "/x | Fable", "the project row alone, never blank");
+
+    let (_, junk, _) = run(&dir, &[("CSR_LINES", "sideways")], &[], HOOK);
+    assert_eq!(junk, multi, "an unknown value changes nothing");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
