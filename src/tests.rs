@@ -2416,12 +2416,6 @@ fn activity_counts_this_turns_tools_most_used_first() {
 
 #[test]
 fn activity_agents_running_until_their_result_or_completion_notice() {
-    let notice = |id: &str| {
-        serde_json::json!({"type":"user","origin":{"kind":"task-notification"},
-            "message":{"role":"user","content":format!(
-                "<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>{id}</tool-use-id>\n<status>completed</status>\n</task-notification>")}})
-        .to_string()
-    };
     let lines = vec![
         human("fan out"),
         // finished in the foreground
@@ -2676,4 +2670,151 @@ fn activity_cost_on_a_large_transcript() {
     assert!(line.is_some());
     assert!(per < std::time::Duration::from_millis(5), "{per:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn notice(id: &str) -> String {
+    serde_json::json!({"type":"user","origin":{"kind":"task-notification"},
+        "message":{"role":"user","content":format!(
+            "<task-notification>\n<task-id>x</task-id>\n<tool-use-id>{id}</tool-use-id>\n<status>completed</status>\n</task-notification>")}})
+    .to_string()
+}
+
+#[test]
+fn activity_background_agents_keep_running_across_turns() {
+    let launched = serde_json::json!({"status":"async_launched"});
+    let base = vec![
+        human("turn one"),
+        tool_use("bg", "Agent", serde_json::json!({"description":"long job"})),
+        tool_result("bg", launched.clone()),
+        // a foreground agent that finished in turn one: done, then forgotten
+        tool_use("fg", "Agent", serde_json::json!({})),
+        tool_result("fg", serde_json::json!({"status":"completed"})),
+        // a foreground call interrupted before its result: dropped next turn
+        tool_use("cut", "Agent", serde_json::json!({})),
+        human("turn two"),
+        tool_use("t1", "Read", serde_json::json!({})),
+        human("turn three"),
+        tool_use("t2", "Bash", serde_json::json!({})),
+    ];
+    let a = scan_activity(&jsonl(&base));
+    assert_eq!((a.agents_running, a.agents_done), (1, 0));
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: Bash x1 | agents: 1 running")
+    );
+
+    // its notice arrives in the current turn: done this turn
+    let mut arrived = base.clone();
+    arrived.push(notice("bg"));
+    let a = scan_activity(&jsonl(&arrived));
+    assert_eq!((a.agents_running, a.agents_done), (0, 1));
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("tools: Bash x1 | agents: 1 done")
+    );
+
+    // a turn later the finished agent is no longer counted
+    arrived.push(human("turn four"));
+    assert_eq!(
+        scan_activity(&jsonl(&arrived)),
+        Activity::default(),
+        "done is per turn"
+    );
+}
+
+#[test]
+fn activity_shortens_mcp_tool_names() {
+    assert_eq!(
+        short_tool_name("mcp__claude_ai_Slack__slack_send_message"),
+        "slack_send_message"
+    );
+    assert_eq!(short_tool_name("mcp__github__get_issue"), "get_issue");
+    assert_eq!(short_tool_name("mcp__mcp"), "mcp__mcp", "no tool part");
+    assert_eq!(short_tool_name("mcp____x"), "mcp____x", "empty server");
+    assert_eq!(short_tool_name("mcp__srv__"), "mcp__srv__", "empty tool");
+    assert_eq!(short_tool_name("Bash"), "Bash");
+    let lines = vec![
+        human("x"),
+        tool_use("m1", "mcp__a__search", serde_json::json!({})),
+        tool_use("m2", "mcp__b__search", serde_json::json!({})),
+        tool_use("m3", "mcp__mcp", serde_json::json!({})),
+    ];
+    assert_eq!(
+        activity_line(&scan_activity(&jsonl(&lines)), &plain()).as_deref(),
+        Some("tools: search x2 mcp__mcp x1")
+    );
+}
+
+#[test]
+fn activity_task_list_from_taskcreate_and_taskupdate() {
+    // shapes from a real Claude Code 2.1.293 transcript, ids and text changed
+    let create = |call: &str, task: &str, subject: &str| {
+        vec![
+            tool_use(
+                call,
+                "TaskCreate",
+                serde_json::json!({"subject":subject,"description":subject}),
+            ),
+            tool_result(
+                call,
+                serde_json::json!({"task":{"id":task,"subject":subject}}),
+            ),
+        ]
+    };
+    let update = |call: &str, task: &str, status: &str| {
+        vec![
+            tool_use(
+                call,
+                "TaskUpdate",
+                serde_json::json!({"taskId":task,"status":status}),
+            ),
+            tool_result(
+                call,
+                serde_json::json!({"success":true,"taskId":task,"updatedFields":["status"],
+                    "statusChange":{"from":"pending","to":status}}),
+            ),
+        ]
+    };
+    let mut lines = vec![human("plan it")];
+    lines.extend(create("c1", "1", "Read the file"));
+    lines.extend(create("c2", "2", "Edit the file"));
+    lines.extend(create("c3", "3", "Run the tests"));
+    lines.extend(update("u1", "1", "completed"));
+    lines.extend(update("u2", "2", "in_progress"));
+    lines.push(human("carry on"));
+    let a = scan_activity(&jsonl(&lines));
+    assert_eq!(
+        activity_line(&a, &plain()).as_deref(),
+        Some("todo: 1/3 done, now: Edit the file")
+    );
+
+    // a deleted task leaves the list; an update for an unknown id is ignored
+    lines.extend(update("u3", "3", "deleted"));
+    lines.extend(update("u4", "99", "completed"));
+    let a = scan_activity(&jsonl(&lines));
+    assert_eq!(
+        a.todo,
+        Some(Todo {
+            done: 1,
+            total: 2,
+            now: Some("Edit the file".into())
+        })
+    );
+
+    // a later TodoWrite replaces the task list, and the other way round
+    lines.push(tool_use(
+        "w1",
+        "TodoWrite",
+        serde_json::json!({"todos":[{"content":"only","status":"pending"}]}),
+    ));
+    assert_eq!(scan_activity(&jsonl(&lines)).todo.map(|t| t.total), Some(1));
+    lines.extend(update("u5", "2", "completed"));
+    assert_eq!(
+        scan_activity(&jsonl(&lines)).todo,
+        Some(Todo {
+            done: 2,
+            total: 2,
+            now: None
+        })
+    );
 }
