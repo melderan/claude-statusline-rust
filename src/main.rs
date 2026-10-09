@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 
 mod activity;
+mod busy;
 mod config;
 mod extras;
 mod flush;
@@ -18,6 +19,7 @@ mod tests;
 mod voice;
 
 use activity::*;
+use busy::*;
 use config::*;
 use extras::*;
 use flush::*;
@@ -98,12 +100,16 @@ fn main() {
         .as_ref()
         .and_then(|w| w.git_worktree.as_deref());
     let opened = open_metrics_db(&cfg, &home);
-    if let Err(e) = &opened
-        && cfg.metrics_db.is_some()
-    {
-        // The shared file is locked or unreachable: this row is skipped,
-        // never forced. One line, so a hook or a log shows it.
-        eprintln!("claude-statusline-rust: metrics skipped: {e}");
+    // A busy or locked file, at open or at insert, skips the row; the status
+    // line says so (`db:locked`) because the stderr line is rarely read.
+    let mut db_locked = false;
+    if let Err(e) = &opened {
+        db_locked |= is_busy(e.as_ref());
+        if cfg.metrics_db.is_some() {
+            // The shared file is locked or unreachable: this row is skipped,
+            // never forced. One line, so a hook or a log shows it.
+            eprintln!("claude-statusline-rust: metrics skipped: {e}");
+        }
     }
     let residue: Vec<i64> = opened
         .ok()
@@ -125,10 +131,11 @@ fn main() {
                 data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
                 Some(&on),
             );
-            if let Err(e) = logged
-                && cfg.metrics_db.is_some()
-            {
-                eprintln!("claude-statusline-rust: metrics row skipped: {e}");
+            if let Err(e) = &logged {
+                db_locked |= is_busy(e.as_ref());
+                if cfg.metrics_db.is_some() {
+                    eprintln!("claude-statusline-rust: metrics row skipped: {e}");
+                }
             }
             match (residue_turns(&cfg.residue), data.session_id.as_deref()) {
                 (n, Some(sid)) if n > 0 => residue_deltas(&conn, sid, n).unwrap_or_default(),
@@ -175,6 +182,7 @@ fn main() {
         git,
         voice,
         activity,
+        db_locked,
         now: now_epoch(),
     };
     let lines = build_lines(&data, &cfg, &env);

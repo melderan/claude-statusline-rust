@@ -61,7 +61,11 @@ fn locked_shared_db_keeps_the_display_and_warns_once() {
     std::fs::create_dir_all(format!("{dbs}.lock")).unwrap();
     let (code, locked, err) = run(&dir, &[("CSR_METRICS_DB", &dbs)], &[], HOOK);
     assert_eq!(code, 0, "a held lock never fails the render");
-    assert_eq!(locked, unlocked, "display identical with the lock held");
+    assert_eq!(
+        locked,
+        format!("{unlocked}\ndb:locked"),
+        "display is the same plus the marker with the lock held"
+    );
     assert_eq!(err.lines().count(), 1, "exactly one stderr line: {err:?}");
     assert!(err.contains("locked"), "{err}");
     assert!(

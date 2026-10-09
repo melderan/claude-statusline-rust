@@ -1908,6 +1908,7 @@ fn fixture_env() -> Env {
         git: None,
         voice: None,
         activity: None,
+        db_locked: false,
         now: 2_000_000,
     }
 }

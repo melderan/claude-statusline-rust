@@ -201,7 +201,7 @@ pub(crate) fn add_always_on_file(
     let text = String::from_utf8_lossy(&bytes);
     let n = text.chars().count() as u64;
     out.chars += n;
-    out.files.push((path.to_string_lossy().into_owned(), n));
+    out.files.push((clean_path(path), n));
     if depth >= IMPORT_MAX_DEPTH {
         return;
     }
@@ -221,6 +221,18 @@ pub(crate) fn add_always_on_file(
     }
 }
 
+/// `path` as text with no `.` segments and no doubled slashes, so an import
+/// like `./a/../b` reached through `base/./x` is listed once and readably.
+/// `..` is left alone: resolving it without the filesystem is wrong across
+/// symlinks.
+fn clean_path(path: &std::path::Path) -> String {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// `@path` imports in a CLAUDE.md: an `@` at line start or after whitespace,
 /// then the path up to the next whitespace. A bare name (`@HOUSE.md`) is an
 /// import too; a name that is not a file is skipped at read time. Fenced
@@ -228,14 +240,18 @@ pub(crate) fn add_always_on_file(
 pub(crate) fn claude_md_imports(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     // An open fence: (fence char, run length). Closed by a run of the same
-    // char at least as long, alone on its line.
+    // char at least as long, alone on its line, indented at most 3 columns.
     let mut fence: Option<(char, usize)> = None;
+    // The previous line was a paragraph line. An indented line right after
+    // one continues the paragraph; it is code only after a blank line, a
+    // heading, a rule or another code line (CommonMark 4.4).
+    let mut paragraph = false;
     for line in text.lines() {
         let t = line.trim_start();
-        let indent = line.len() - t.len();
+        let indent = indent_columns(line);
         if let Some((fc, n)) = fence {
             let run = t.chars().take_while(|&c| c == fc).count();
-            if run >= n && t[run..].trim().is_empty() {
+            if indent <= 3 && run >= n && t[run..].trim().is_empty() {
                 fence = None;
             }
             continue;
@@ -246,14 +262,20 @@ pub(crate) fn claude_md_imports(text: &str) -> Vec<String> {
                 let run = t.chars().take_while(|&c| c == fc).count();
                 if run >= 3 {
                     fence = Some((fc, run));
+                    paragraph = false;
                     continue;
                 }
             }
         }
-        // Indented code block: four spaces or a tab.
-        if line.starts_with("    ") || line.starts_with('\t') {
+        if t.is_empty() {
+            paragraph = false;
             continue;
         }
+        // Indented code block: four columns of indent, not inside a paragraph.
+        if indent >= 4 && !paragraph {
+            continue;
+        }
+        paragraph = indent >= 4 || is_paragraph_text(t);
         let plain = strip_code_spans(line);
         // `@` counts at line start or after whitespace, so `me@example.com`
         // is not an import. Byte offsets index `plain`, never a char count.
@@ -281,6 +303,37 @@ pub(crate) fn claude_md_imports(text: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Columns of leading space on `line`, a tab advancing to the next multiple
+/// of four.
+fn indent_columns(line: &str) -> usize {
+    let mut cols = 0;
+    for ch in line.chars() {
+        match ch {
+            ' ' => cols += 1,
+            '\t' => cols += 4 - cols % 4,
+            _ => break,
+        }
+    }
+    cols
+}
+
+/// Whether a line of at most three columns of indent (given trimmed) is
+/// paragraph text that a following indented line continues: not an ATX
+/// heading, a thematic break or a setext underline.
+fn is_paragraph_text(t: &str) -> bool {
+    let hashes = t.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && t[hashes..].chars().next().is_none_or(char::is_whitespace) {
+        return false;
+    }
+    let marks: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
+    let uniform = marks.windows(2).all(|w| w[0] == w[1]);
+    let rule = marks.len() >= 3 && uniform && matches!(marks[0], '-' | '*' | '_');
+    let underline = !marks.is_empty()
+        && marks.iter().all(|&c| c == '=')
+        && !t.trim_end().contains(char::is_whitespace);
+    !(rule || underline)
 }
 
 /// Replace inline code spans with a space, CommonMark style: a run of N
@@ -333,3 +386,6 @@ pub(crate) fn strip_code_spans(line: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod scan_tests;

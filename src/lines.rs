@@ -42,21 +42,26 @@ pub(crate) mod rank {
     /// The activity row (tools, agents, todo) goes before the misc tags.
     pub(crate) const ACTIVITY: u8 = 4;
     pub(crate) const MISC: u8 = 5;
+    /// `db:locked` is a fault, not a reading, and it is rare: it outlasts
+    /// the routine tags above it so the condition is still visible on a
+    /// narrow line, but it goes before any piece of the ctx, project or git
+    /// rows, which say what the session is.
+    pub(crate) const DB_LOCKED: u8 = 6;
     /// ctx tail: the cache segment, then last in/out, then the cost.
-    pub(crate) const CTX_CACHE: u8 = 6;
-    pub(crate) const CTX_LAST: u8 = 7;
-    pub(crate) const CTX_COST: u8 = 8;
+    pub(crate) const CTX_CACHE: u8 = 7;
+    pub(crate) const CTX_LAST: u8 = 8;
+    pub(crate) const CTX_COST: u8 = 9;
     /// project tail: CC version, memory sizes, always-on size, duration.
-    pub(crate) const PROJECT_CC: u8 = 9;
-    pub(crate) const PROJECT_MEM: u8 = 10;
-    pub(crate) const PROJECT_ON: u8 = 11;
-    pub(crate) const PROJECT_DUR: u8 = 12;
+    pub(crate) const PROJECT_CC: u8 = 10;
+    pub(crate) const PROJECT_MEM: u8 = 11;
+    pub(crate) const PROJECT_ON: u8 = 12;
+    pub(crate) const PROJECT_DUR: u8 = 13;
     /// git tail: the age, then the PR tag.
-    pub(crate) const GIT_AGE: u8 = 13;
-    pub(crate) const GIT_PR: u8 = 14;
+    pub(crate) const GIT_AGE: u8 = 14;
+    pub(crate) const GIT_PR: u8 = 15;
     /// Heads, last to go: git, then ctx. The project head is KEEP.
-    pub(crate) const GIT_HEAD: u8 = 15;
-    pub(crate) const CTX_HEAD: u8 = 16;
+    pub(crate) const GIT_HEAD: u8 = 16;
+    pub(crate) const CTX_HEAD: u8 = 17;
 }
 
 /// A run of text inside a row, with the place it takes in the drop order.
@@ -154,6 +159,9 @@ pub(crate) struct Env {
     pub(crate) voice: Option<String>,
     /// The activity line, already read from the transcript tail.
     pub(crate) activity: Option<String>,
+    /// This render's metrics row was skipped because the database was busy
+    /// or locked.
+    pub(crate) db_locked: bool,
     pub(crate) now: i64,
 }
 
@@ -251,7 +259,7 @@ pub(crate) fn build_lines(data: &Input, cfg: &Config, env: &Env) -> Lines {
     }
     lines.five_hour = five_hour_row(data, cfg, env.now);
     lines.seven_day = seven_day_row(data, cfg, env.now);
-    lines.misc = Row::whole(misc_text(data, cfg, env), rank::MISC);
+    lines.misc = misc_row(data, cfg, env);
     lines
 }
 
@@ -484,6 +492,25 @@ fn seven_day_row(data: &Input, cfg: &Config, now: i64) -> Row {
         out.push_str(&fmt_pace(p, cfg));
     }
     Row::whole(out, rank::SEVEN_DAY)
+}
+
+/// The misc tags, led by `db:locked` when the metrics row was skipped. It is
+/// its own piece, first in the row, so one-line mode can drop the tags and
+/// keep the marker, and what is left still reads as a whole.
+fn misc_row(data: &Input, cfg: &Config, env: &Env) -> Row {
+    let tags = misc_text(data, cfg, env);
+    let mut row = Row::default();
+    if env.db_locked {
+        row.push_tail(
+            format!("{}db:locked{}", c(cfg, AMBER), reset(cfg)),
+            rank::DB_LOCKED,
+        );
+    }
+    let sep = if env.db_locked { " | " } else { "" };
+    if !tags.is_empty() {
+        row.push_tail(format!("{sep}{tags}"), rank::MISC);
+    }
+    row
 }
 
 fn misc_text(data: &Input, cfg: &Config, env: &Env) -> String {
