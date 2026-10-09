@@ -8,6 +8,12 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 - `db:locked` marker on the misc line when a render skips its metrics row because the database is busy or locked, for both the default local file and a shared `metrics_db`. It is kept in one-line mode until the ctx tail would have to go.
 
+### Fixed
+
+- Always-on count: an indented line directly after a paragraph line is a continuation of the paragraph, not an indented code block.
+- Always-on count: a closing code fence may be indented at most three spaces and must be at least as long as the opening fence, with the same character.
+- Always-on count: `always_on_files` lists cleaned paths, with no `./` segments or doubled slashes.
+
 ## [1.0.0] - 2026-10-09
 
 ### Added
