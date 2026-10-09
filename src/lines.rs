@@ -1,7 +1,7 @@
 use crate::*;
 
 // ─────────────────────────────────────────────────────────────────────
-// Lines: each row of the status line is built as its own String, then
+// Lines: each row of the status line is built as its own value, then
 // assembled either one per row (the default) or into a single row.
 // Building takes everything that touches the machine (git, the memory
 // directory, the metrics database, the voice card, the clock) as an `Env`
@@ -29,17 +29,108 @@ impl LineMode {
     }
 }
 
-/// The rows, in render order. An empty String means the row is absent.
-#[derive(Default, Debug, PartialEq, Eq)]
+/// Rank of a piece that is never dropped.
+pub(crate) const KEEP: u8 = u8::MAX;
+
+/// Drop order for one-line mode: a piece with a lower rank goes first.
+/// Tails of every row go before any head, so a narrow line keeps the
+/// project, the context size and the branch the longest.
+pub(crate) mod rank {
+    pub(crate) const RESIDUE: u8 = 1;
+    pub(crate) const SEVEN_DAY: u8 = 2;
+    pub(crate) const FIVE_HOUR: u8 = 3;
+    pub(crate) const MISC: u8 = 4;
+    /// ctx tail: the cache segment, then last in/out, then the cost.
+    pub(crate) const CTX_CACHE: u8 = 5;
+    pub(crate) const CTX_LAST: u8 = 6;
+    pub(crate) const CTX_COST: u8 = 7;
+    /// project tail: CC version, memory sizes, always-on size, duration.
+    pub(crate) const PROJECT_CC: u8 = 8;
+    pub(crate) const PROJECT_MEM: u8 = 9;
+    pub(crate) const PROJECT_ON: u8 = 10;
+    pub(crate) const PROJECT_DUR: u8 = 11;
+    /// git tail: the age, then the PR tag.
+    pub(crate) const GIT_AGE: u8 = 12;
+    pub(crate) const GIT_PR: u8 = 13;
+    /// Heads, last to go: git, then ctx. The project head is KEEP.
+    pub(crate) const GIT_HEAD: u8 = 14;
+    pub(crate) const CTX_HEAD: u8 = 15;
+}
+
+/// A run of text inside a row, with the place it takes in the drop order.
+/// A piece carries its own leading separator, so any subset of a row's
+/// pieces, in order, reads as a whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Piece {
+    pub(crate) text: String,
+    pub(crate) rank: u8,
+    /// Part of the row's head (what the row is about) rather than its tail.
+    pub(crate) head: bool,
+}
+
+/// One row of the status line: its pieces, in print order.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub(crate) struct Row {
+    pub(crate) pieces: Vec<Piece>,
+}
+
+impl Row {
+    pub(crate) fn push_head(&mut self, text: String, rank: u8) {
+        self.push(text, rank, true);
+    }
+
+    pub(crate) fn push_tail(&mut self, text: String, rank: u8) {
+        self.push(text, rank, false);
+    }
+
+    fn push(&mut self, text: String, rank: u8, head: bool) {
+        if !text.is_empty() {
+            self.pieces.push(Piece { text, rank, head });
+        }
+    }
+
+    /// A row that is one piece, dropped whole.
+    pub(crate) fn whole(text: String, rank: u8) -> Self {
+        let mut row = Self::default();
+        row.push_tail(text, rank);
+        row
+    }
+
+    /// The row as printed in multi-line mode: every piece, in order.
+    pub(crate) fn text(&self) -> String {
+        self.pieces.iter().map(|p| p.text.as_str()).collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+}
+
+/// The rows, in render order. An empty row is absent.
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub(crate) struct Lines {
-    /// Project, model, version, duration, memory sizes, always-on size.
-    pub(crate) project: String,
-    pub(crate) ctx: String,
-    pub(crate) residue: String,
-    pub(crate) git: String,
-    pub(crate) five_hour: String,
-    pub(crate) seven_day: String,
-    pub(crate) misc: String,
+    /// Project, model, then version, duration, memory sizes, always-on size.
+    pub(crate) project: Row,
+    pub(crate) ctx: Row,
+    pub(crate) residue: Row,
+    pub(crate) git: Row,
+    pub(crate) five_hour: Row,
+    pub(crate) seven_day: Row,
+    pub(crate) misc: Row,
+}
+
+impl Lines {
+    pub(crate) fn in_order(&self) -> [&Row; 7] {
+        [
+            &self.project,
+            &self.ctx,
+            &self.residue,
+            &self.git,
+            &self.five_hour,
+            &self.seven_day,
+            &self.misc,
+        ]
+    }
 }
 
 /// Everything build_lines() needs that is not in the hook payload or the
@@ -103,128 +194,134 @@ pub(crate) fn build_lines(data: &Input, cfg: &Config, env: &Env) -> Lines {
     let num = ctx_numbers(data);
 
     let mut lines = Lines {
-        project: project_line(data, cfg, env, project_dir, current_dir),
+        project: project_row(data, cfg, env, project_dir, current_dir),
         ..Lines::default()
     };
 
     // Cost and cache ride on the end of the ctx row. With no context window
     // size there is no ctx row, and they land on the project row instead, as
     // they always have.
-    let mut tail = String::new();
+    let mut tail: Vec<Piece> = Vec::new();
     if let Some(usd) = data.cost.as_ref().and_then(|c| c.total_cost_usd)
         && usd > 0.001
     {
-        let _ = write!(tail, " {}|{} ${:.2}", c(cfg, DIM), rst, usd);
+        tail.push(Piece {
+            text: format!(" {}|{} ${:.2}", c(cfg, DIM), rst, usd),
+            rank: rank::CTX_COST,
+            head: false,
+        });
     }
     if cfg.cache
         && let Some(pc) = data.prompt_cache.as_ref()
         && let Some(seg) = cache_segment(pc, env.now, cfg)
     {
-        let _ = write!(tail, " {}|{} {}", c(cfg, DIM), rst, seg);
+        tail.push(Piece {
+            text: format!(" {}|{} {}", c(cfg, DIM), rst, seg),
+            rank: rank::CTX_CACHE,
+            head: false,
+        });
     }
-    if num.cap > 0 {
-        lines.ctx = ctx_line(data, cfg, env, &num);
-        lines.ctx.push_str(&tail);
+    let target = if num.cap > 0 {
+        lines.ctx = ctx_row(data, cfg, env, &num);
+        &mut lines.ctx
     } else {
-        lines.project.push_str(&tail);
-    }
+        &mut lines.project
+    };
+    target.pieces.extend(tail);
 
     if !env.residue.is_empty() {
-        lines.residue.push_str("res:");
+        let mut text = String::from("res:");
         for d in &env.residue {
-            lines.residue.push(' ');
-            lines.residue.push_str(&fmt_delta(*d));
+            text.push(' ');
+            text.push_str(&fmt_delta(*d));
         }
+        lines.residue = Row::whole(text, rank::RESIDUE);
     }
 
-    lines.git = git_line(data, cfg, env);
-    lines.five_hour = five_hour_line(data, cfg, env.now);
-    lines.seven_day = seven_day_line(data, cfg, env.now);
-    lines.misc = misc_line(data, cfg, env);
+    lines.git = git_row(data, cfg, env);
+    lines.five_hour = five_hour_row(data, cfg, env.now);
+    lines.seven_day = seven_day_row(data, cfg, env.now);
+    lines.misc = Row::whole(misc_text(data, cfg, env), rank::MISC);
     lines
 }
 
-/// project [→ cur] | model | CC:version | duration | memory | always-on
-fn project_line(
-    data: &Input,
-    cfg: &Config,
-    env: &Env,
-    project_dir: &str,
-    current_dir: &str,
-) -> String {
+/// Head: project path (tilde form, with `cd` suffix) and model. Tail: CC
+/// version, duration, memory sizes, always-on size.
+fn project_row(data: &Input, cfg: &Config, env: &Env, project_dir: &str, current_dir: &str) -> Row {
     let rst = reset(cfg);
-    let mut out = String::new();
+    let mut row = Row::default();
     let rel_cur = if !project_dir.is_empty() && !current_dir.is_empty() {
         relative_current(project_dir, current_dir)
     } else {
         None
     };
+    let mut path = String::new();
     if !project_dir.is_empty() {
-        out.push_str(&tilde(project_dir));
+        path.push_str(&tilde(project_dir));
         if let Some(suffix) = &rel_cur {
             if cfg.glyphs {
-                let _ = write!(out, " {}\u{2192}{} {}", c(cfg, DIM), rst, suffix);
+                let _ = write!(path, " {}\u{2192}{} {}", c(cfg, DIM), rst, suffix);
             } else {
-                let _ = write!(out, " {}|{} cd:{}", c(cfg, DIM), rst, suffix);
+                let _ = write!(path, " {}|{} cd:{}", c(cfg, DIM), rst, suffix);
             }
         }
     }
+    let path_empty = path.is_empty();
+    row.push_head(path, KEEP);
 
     if let Some(name) = data.model.as_ref().and_then(|m| m.display_name.as_deref()) {
         let short = name.strip_prefix("Claude ").unwrap_or(name);
-        if !out.is_empty() {
-            out.push_str(" | ");
-        }
-        out.push_str(short);
+        let sep = if path_empty { "" } else { " | " };
+        row.push_head(format!("{sep}{short}"), KEEP);
     }
 
     if let Some(cc) = data.version.as_deref() {
-        let _ = write!(out, " {}|{} CC:{}", c(cfg, DIM), rst, cc);
+        row.push_tail(
+            format!(" {}|{} CC:{}", c(cfg, DIM), rst, cc),
+            rank::PROJECT_CC,
+        );
     }
 
     if let Some(ms) = data.cost.as_ref().and_then(|c| c.total_duration_ms) {
         let label = if cfg.glyphs { "\u{23F1}" } else { "dur:" };
-        let _ = write!(
-            out,
-            " {}|{} {}{}",
-            c(cfg, DIM),
-            rst,
-            label,
-            fmt_duration_ms(ms)
+        row.push_tail(
+            format!(" {}|{} {}{}", c(cfg, DIM), rst, label, fmt_duration_ms(ms)),
+            rank::PROJECT_DUR,
         );
     }
 
     let (idx, other) = env.memory;
     if !project_dir.is_empty() && (idx > 0 || other > 0) {
-        let _ = write!(
-            out,
-            " {}|{} mem:{}+{}",
-            c(cfg, DIM),
-            rst,
-            fmt_bytes(idx),
-            fmt_bytes(other)
+        row.push_tail(
+            format!(
+                " {}|{} mem:{}+{}",
+                c(cfg, DIM),
+                rst,
+                fmt_bytes(idx),
+                fmt_bytes(other)
+            ),
+            rank::PROJECT_MEM,
         );
     }
 
     if env.on_chars > 0 {
-        let _ = write!(
-            out,
-            " {}|{} on:{}",
-            c(cfg, DIM),
-            rst,
-            fmt_chars(env.on_chars)
+        row.push_tail(
+            format!(" {}|{} on:{}", c(cfg, DIM), rst, fmt_chars(env.on_chars)),
+            rank::PROJECT_ON,
         );
     }
-    out
+    row
 }
 
-/// ctx [bar] pct (used/cap) [compact marker] [200k+] [| last in/out].
-/// Empty when the window size is unknown.
-fn ctx_line(data: &Input, cfg: &Config, env: &Env, num: &CtxNumbers) -> String {
+/// Head: `ctx [bar] pct (used/cap)` with the compact and 200k+ markers.
+/// Tail: `last in/out`, then cost and cache (added by build_lines). Empty
+/// when the window size is unknown.
+fn ctx_row(data: &Input, cfg: &Config, env: &Env, num: &CtxNumbers) -> Row {
     let rst = reset(cfg);
     let cap = num.cap;
+    let mut row = Row::default();
     if cap <= 0 {
-        return String::new();
+        return row;
     }
     let current_tok = ((num.computed_pct / 100.0) * cap as f64) as i64;
     let pct_int = num.computed_pct.round() as i32;
@@ -256,32 +353,42 @@ fn ctx_line(data: &Input, cfg: &Config, env: &Env, num: &CtxNumbers) -> String {
     if cfg.extras && data.exceeds_200k_tokens == Some(true) {
         let _ = write!(out, " {}200k+{}", c(cfg, AMBER), rst);
     }
+    row.push_head(out, rank::CTX_HEAD);
     if env.mode == Mode::Standard {
-        let _ = write!(
-            out,
-            " {}|{} last in:{} out:{}",
-            c(cfg, DIM),
-            rst,
-            num.in_tok,
-            num.out_tok
+        row.push_tail(
+            format!(
+                " {}|{} last in:{} out:{}",
+                c(cfg, DIM),
+                rst,
+                num.in_tok,
+                num.out_tok
+            ),
+            rank::CTX_LAST,
         );
     }
-    out
+    row
 }
 
-/// git: branch (age) * ahead behind | PR; or the bare worktree name when
-/// the repository could not be opened. Empty when neither is known.
-fn git_line(data: &Input, cfg: &Config, env: &Env) -> String {
+/// Head: `git: branch`, dirty star, ahead and behind. Tail: the age and
+/// the PR tag. Or the bare worktree name when the repository could not be
+/// opened. Empty when neither is known.
+fn git_row(data: &Input, cfg: &Config, env: &Env) -> Row {
     let rst = reset(cfg);
-    let mut out = String::new();
+    let mut row = Row::default();
     if let Some(g) = &env.git {
-        let _ = write!(out, "git: {}", g.branch);
+        row.push_head(format!("git: {}", g.branch), rank::GIT_HEAD);
         if let Some(secs) = g.age_secs {
             let (label, color) = fmt_age_secs(secs);
-            let _ = write!(out, " {}({}){}", c(cfg, color), label, rst);
+            row.push_tail(
+                format!(" {}({}){}", c(cfg, color), label, rst),
+                rank::GIT_AGE,
+            );
         }
         if g.dirty {
-            let _ = write!(out, " {}*{}", c(cfg, "\x1b[38;2;251;191;36m"), rst);
+            row.push_head(
+                format!(" {}*{}", c(cfg, "\x1b[38;2;251;191;36m"), rst),
+                rank::GIT_HEAD,
+            );
         }
         if g.ahead > 0 {
             let (sym, color) = if cfg.glyphs {
@@ -289,7 +396,10 @@ fn git_line(data: &Input, cfg: &Config, env: &Env) -> String {
             } else {
                 ("ahead:", "\x1b[38;2;74;222;128m")
             };
-            let _ = write!(out, " {}{}{}{}", c(cfg, color), sym, g.ahead, rst);
+            row.push_head(
+                format!(" {}{}{}{}", c(cfg, color), sym, g.ahead, rst),
+                rank::GIT_HEAD,
+            );
         }
         if g.behind > 0 {
             let (sym, color) = if cfg.glyphs {
@@ -297,12 +407,15 @@ fn git_line(data: &Input, cfg: &Config, env: &Env) -> String {
             } else {
                 ("behind:", "\x1b[38;2;251;113;133m")
             };
-            let _ = write!(out, " {}{}{}{}", c(cfg, color), sym, g.behind, rst);
+            row.push_head(
+                format!(" {}{}{}{}", c(cfg, color), sym, g.behind, rst),
+                rank::GIT_HEAD,
+            );
         }
         if cfg.extras
             && let Some(tag) = data.pr.as_ref().and_then(pr_tag)
         {
-            let _ = write!(out, " {}|{} {}", c(cfg, DIM), rst, tag);
+            row.push_tail(format!(" {}|{} {}", c(cfg, DIM), rst, tag), rank::GIT_PR);
         }
     } else if let Some(br) = data
         .workspace
@@ -310,14 +423,14 @@ fn git_line(data: &Input, cfg: &Config, env: &Env) -> String {
         .and_then(|w| w.git_worktree.as_deref())
     {
         // Fallback if gix couldn't open (e.g., not a git repo from the hook's view)
-        let _ = write!(out, "git: {}", br);
+        row.push_head(format!("git: {}", br), rank::GIT_HEAD);
     }
-    out
+    row
 }
 
-fn five_hour_line(data: &Input, cfg: &Config, now: i64) -> String {
+fn five_hour_row(data: &Input, cfg: &Config, now: i64) -> Row {
     let Some(five) = data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()) else {
-        return String::new();
+        return Row::default();
     };
     let pct = five.used_percentage.unwrap_or(0.0);
     let icon = if pct > 80.0 {
@@ -338,16 +451,16 @@ fn five_hour_line(data: &Input, cfg: &Config, now: i64) -> String {
     {
         out.push_str(&fmt_pace(p, cfg));
     }
-    out
+    Row::whole(out, rank::FIVE_HOUR)
 }
 
-fn seven_day_line(data: &Input, cfg: &Config, now: i64) -> String {
+fn seven_day_row(data: &Input, cfg: &Config, now: i64) -> Row {
     let Some(seven) = data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()) else {
-        return String::new();
+        return Row::default();
     };
     let pct = seven.used_percentage.unwrap_or(0.0);
     if pct <= 0.0 {
-        return String::new();
+        return Row::default();
     }
     let reset = seven
         .resets_at
@@ -360,10 +473,10 @@ fn seven_day_line(data: &Input, cfg: &Config, now: i64) -> String {
     {
         out.push_str(&fmt_pace(p, cfg));
     }
-    out
+    Row::whole(out, rank::SEVEN_DAY)
 }
 
-fn misc_line(data: &Input, cfg: &Config, env: &Env) -> String {
+fn misc_text(data: &Input, cfg: &Config, env: &Env) -> String {
     let mut misc: Vec<String> = Vec::new();
     if cfg.extras {
         misc.extend(mode_tags(data));
@@ -416,14 +529,17 @@ pub(crate) fn visible_len(s: &str) -> usize {
 }
 
 /// `multi`: one row each, in render order. `one`: the non-empty rows joined
-/// by a dim ` | `. When that is wider than `width`, whole rows are dropped,
-/// lowest priority first (residue, seven-day, five-hour, misc, git, ctx),
-/// until it fits. The project row is never dropped, so the line is never
-/// blank; if it alone is too wide the terminal clips it.
+/// by a dim ` | `, in render order. When that is wider than `width`, pieces
+/// are dropped in rank order (see `rank`) until it fits: the residue row,
+/// the rate-limit rows and the misc row, then the tail of each of ctx,
+/// project and git, then the git head and the ctx head. The project head
+/// (path and model) is never dropped, and neither is the last piece left,
+/// so the line is never blank; if what remains is still too wide the
+/// terminal clips it.
 ///
 /// Interaction with Compact display mode (`pick_mode`, under 60 columns):
-/// the two are independent. Compact shortens the bar and drops `last in/out`
-/// from the ctx row; `one` then drops whole rows to fit the same width.
+/// the two are independent. Compact shortens the bar and leaves `last in/out`
+/// off the ctx row; `one` then drops pieces to fit the same width.
 pub(crate) fn assemble(lines: &Lines, cfg: &Config, width: usize) -> String {
     match cfg.line_mode() {
         LineMode::Multi => assemble_multi(lines),
@@ -436,54 +552,54 @@ fn assemble_multi(lines: &Lines) -> String {
     // The first row is written even when empty; the rest bring their own
     // newline, so an absent project row leaves a leading blank line as it
     // always did.
-    out.push_str(&lines.project);
-    for row in [
-        &lines.ctx,
-        &lines.residue,
-        &lines.git,
-        &lines.five_hour,
-        &lines.seven_day,
-        &lines.misc,
-    ] {
+    let rows = lines.in_order();
+    out.push_str(&rows[0].text());
+    for row in &rows[1..] {
         if !row.is_empty() {
             out.push('\n');
-            out.push_str(row);
+            out.push_str(&row.text());
         }
     }
     out
 }
 
+/// Width of the rows joined by a 3-column separator.
+fn joined_width(rows: &[Row]) -> usize {
+    let widths: Vec<usize> = rows
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| visible_len(&r.text()))
+        .collect();
+    widths.iter().sum::<usize>() + 3 * widths.len().saturating_sub(1)
+}
+
 fn assemble_one(lines: &Lines, cfg: &Config, width: usize) -> String {
-    let sep = dim_bar(cfg);
-    // Display order is render order; drop order is the reverse of priority.
-    let rows: [(&String, u8); 7] = [
-        (&lines.project, 0),
-        (&lines.ctx, 1),
-        (&lines.residue, 6),
-        (&lines.git, 2),
-        (&lines.five_hour, 4),
-        (&lines.seven_day, 5),
-        (&lines.misc, 3),
-    ];
-    let mut kept: Vec<(&String, u8)> = rows.into_iter().filter(|(s, _)| !s.is_empty()).collect();
-    let joined_len = |kept: &[(&String, u8)]| -> usize {
-        let text: usize = kept.iter().map(|(s, _)| visible_len(s)).sum();
-        text + 3 * kept.len().saturating_sub(1)
-    };
-    while kept.len() > 1 && joined_len(&kept) > width {
-        // Lowest priority = highest number; the project row (0) stays.
-        let worst = kept
+    let mut rows: Vec<Row> = lines.in_order().into_iter().cloned().collect();
+    while joined_width(&rows) > width {
+        let next = rows
             .iter()
-            .enumerate()
-            .max_by_key(|(_, (_, p))| *p)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        kept.remove(worst);
+            .flat_map(|r| r.pieces.iter())
+            .map(|p| p.rank)
+            .filter(|r| *r != KEEP)
+            .min();
+        let Some(next) = next else { break };
+        let left: usize = rows
+            .iter()
+            .flat_map(|r| r.pieces.iter())
+            .filter(|p| p.rank != next)
+            .count();
+        if left == 0 {
+            break;
+        }
+        for row in &mut rows {
+            row.pieces.retain(|p| p.rank != next);
+        }
     }
-    kept.iter()
-        .map(|(s, _)| s.as_str())
+    rows.iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| r.text())
         .collect::<Vec<_>>()
-        .join(&sep)
+        .join(&dim_bar(cfg))
 }
 
 // ─────────────────────────────────────────────────────────────────────

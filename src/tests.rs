@@ -1952,13 +1952,14 @@ fn multi_line_without_a_window_size_keeps_cost_on_the_project_row() {
     data.context_window = None;
     let cfg = plain();
     let lines = build_lines(&data, &cfg, &fixture_env());
-    assert_eq!(lines.ctx, "");
+    assert!(lines.ctx.is_empty());
     assert!(
         lines
             .project
+            .text()
             .ends_with(" | $1.23 | cache 97% warm 1h, cold now (13:48Z)"),
         "{}",
-        lines.project
+        lines.project.text()
     );
     assert!(!assemble(&lines, &cfg, 100).contains("ctx "));
 }
@@ -1966,8 +1967,8 @@ fn multi_line_without_a_window_size_keeps_cost_on_the_project_row() {
 #[test]
 fn multi_line_without_a_project_row_starts_with_a_blank_line() {
     let lines = Lines {
-        ctx: "ctx 1%".into(),
-        misc: "m".into(),
+        ctx: Row::whole("ctx 1%".into(), rank::CTX_HEAD),
+        misc: Row::whole("m".into(), rank::MISC),
         ..Lines::default()
     };
     assert_eq!(assemble(&lines, &plain(), 80), "\nctx 1%\nm");
@@ -1976,169 +1977,210 @@ fn multi_line_without_a_project_row_starts_with_a_blank_line() {
 
 #[test]
 fn rows_fill_from_the_environment() {
-    let env = Env {
-        memory: (25_363, 4_000),
-        on_chars: 21_000,
-        residue: vec![74_000, 3_100],
-        git: Some(GitInfo {
-            branch: "main".into(),
-            age_secs: None,
-            ahead: 2,
-            behind: 0,
-            dirty: true,
-        }),
-        voice: Some("voice: amy 2.0x".into()),
-        ..fixture_env()
-    };
+    let env = rich_env();
     let lines = fixture_lines(&plain(), &env);
     assert!(
-        lines.project.ends_with("mem:25KB+4KB | on:21kch"),
+        lines
+            .project
+            .text()
+            .ends_with("dur:1h02m | mem:25KB+4KB | on:21kch"),
         "{}",
-        lines.project
+        lines.project.text()
     );
-    assert_eq!(lines.residue, "res: +74k +3.1k");
-    assert_eq!(lines.git, "git: main * ahead:2 | PR#7 approved");
+    assert_eq!(lines.residue.text(), "res: +74k +3.1k");
+    assert_eq!(lines.git.text(), "git: main (3h) * ahead:2 | PR#7 approved");
     assert_eq!(
-        lines.misc,
+        lines.misc.text(),
         "effort:high | voice: amy 2.0x | [NORMAL] | {reviewer}"
     );
     let off = Config {
         voice: false,
         ..plain()
     };
-    assert!(!fixture_lines(&off, &env).misc.contains("voice"));
+    assert!(!fixture_lines(&off, &env).misc.text().contains("voice"));
 }
 
-#[test]
-fn one_line_at_width_200_keeps_what_fits_and_drops_the_least_important() {
-    let env = Env {
-        residue: vec![74_000],
+/// Every row filled: memory sizes, always-on size, residue, a git row with
+/// age, dirty star, ahead count and a PR tag, and a voice segment.
+fn rich_env() -> Env {
+    Env {
+        memory: (25_363, 4_000),
+        on_chars: 21_000,
+        residue: vec![74_000, 3_100],
+        git: Some(GitInfo {
+            branch: "main".into(),
+            age_secs: Some(3 * 3600),
+            ahead: 2,
+            behind: 0,
+            dirty: true,
+        }),
+        voice: Some("voice: amy 2.0x".into()),
         ..fixture_env()
-    };
+    }
+}
+
+fn one_line(width: usize, env: &Env) -> String {
     let cfg = one_line_cfg();
-    let lines = fixture_lines(&cfg, &env);
-    let out = assemble(&lines, &cfg, 200);
-    assert!(!out.contains('\n'));
-    assert!(visible_len(&out) <= 200, "{} wide", visible_len(&out));
-    // Row widths: project 59, ctx 90, git 13, misc 35, five-hour 66. Misc
-    // would make 206, so it goes, and everything below it with it.
-    assert_eq!(
-        out,
-        "/srv/app | cd:crates/core | Opus 4.6 | CC:2.1.0 | dur:1h02m | ctx 43% (86k/200k) | last in:84210 out:1900 | $1.23 | cache 97% warm 1h, cold now (13:48Z) | git: fix-auth"
-    );
-    assert_eq!(visible_len(&out), 168);
-    // Ten columns more and the misc row fits; the windows are still below it.
-    let out = assemble(&lines, &cfg, 210);
-    assert!(out.ends_with(" | git: fix-auth | effort:high | [NORMAL] | {reviewer}"));
-    assert!(!out.contains("res:") && !out.contains("window"), "{out}");
+    assemble(&fixture_lines(&cfg, env), &cfg, width)
 }
 
 #[test]
-fn one_line_everything_fits_when_the_terminal_is_wide_enough() {
-    let env = Env {
-        residue: vec![74_000],
-        ..fixture_env()
-    };
+fn one_line_at_width_1000_prints_every_row_in_render_order() {
+    let env = rich_env();
     let cfg = one_line_cfg();
     let lines = fixture_lines(&cfg, &env);
     let out = assemble(&lines, &cfg, 1000);
-    let rows = [
-        &lines.project,
-        &lines.ctx,
-        &lines.residue,
-        &lines.git,
-        &lines.five_hour,
-        &lines.seven_day,
-        &lines.misc,
-    ];
+    let rows: Vec<String> = lines.in_order().iter().map(|r| r.text()).collect();
+    assert_eq!(out, rows.join(" | "), "plain separator when colour is off");
+    assert!(!out.contains('\n'));
+}
+
+#[test]
+fn one_line_at_width_200_keeps_everything_but_the_lowest_tails() {
+    let out = one_line(200, &rich_env());
     assert_eq!(
         out,
-        rows.iter()
-            .map(|r| r.as_str())
-            .collect::<Vec<_>>()
-            .join(" | "),
-        "render order, plain separator when colour is off"
+        "/srv/app | cd:crates/core | Opus 4.6 | CC:2.1.0 | dur:1h02m | mem:25KB+4KB | on:21kch | ctx 43% (86k/200k) | last in:84210 out:1900 | $1.23 | git: main (3h) * ahead:2 | PR#7 approved"
     );
+    assert_eq!(visible_len(&out), 182);
+    // Gone, in drop order: residue, seven-day, five-hour, misc, cache.
+    for gone in ["res:", "7d window", "5h window", "effort:high", "cache"] {
+        assert!(!out.contains(gone), "{gone}: {out}");
+    }
 }
 
 #[test]
-fn one_line_at_width_80_keeps_only_the_project_row_here() {
-    let cfg = one_line_cfg();
-    let lines = fixture_lines(&cfg, &fixture_env());
-    // The project row is 59 columns and ctx 90: the pair needs 152.
-    let out = assemble(&lines, &cfg, 80);
+fn one_line_at_width_120_drops_the_ctx_and_project_tails() {
+    let out = one_line(120, &rich_env());
     assert_eq!(
         out,
-        "/srv/app | cd:crates/core | Opus 4.6 | CC:2.1.0 | dur:1h02m"
+        "/srv/app | cd:crates/core | Opus 4.6 | dur:1h02m | ctx 43% (86k/200k) | git: main (3h) * ahead:2 | PR#7 approved"
     );
-    assert!(visible_len(&out) <= 80);
-    let out = assemble(&lines, &cfg, 151);
-    assert!(!out.contains("ctx 43%"), "{out}");
-    let out = assemble(&lines, &cfg, 152);
-    assert!(out.ends_with("(13:48Z)") && !out.contains("git:"), "{out}");
-    assert_eq!(visible_len(&out), 152);
-    let out = assemble(&lines, &cfg, 170);
-    assert!(out.ends_with(" | git: fix-auth"), "{out}");
+    assert_eq!(visible_len(&out), 112);
+    // Strict drop order: the whole ctx tail (cost last) goes before any of
+    // the project tail, even though keeping the cost would have fit once the
+    // version, memory and always-on sizes were gone.
+    for gone in ["last in", "$1.23", "CC:", "mem:", "on:21"] {
+        assert!(!out.contains(gone), "{gone}: {out}");
+    }
 }
 
 #[test]
-fn one_line_at_width_40_never_goes_blank() {
-    let cfg = one_line_cfg();
-    let lines = fixture_lines(&cfg, &fixture_env());
-    let out = assemble(&lines, &cfg, 40);
+fn one_line_tails_drop_one_piece_at_a_time_in_rank_order() {
+    let env = rich_env();
+    // 182 columns is everything left once the cache segment has gone.
+    // One column less and last in/out goes next; the cost outlasts it.
+    let out = one_line(182, &env);
+    assert!(
+        out.contains("last in:84210") && out.contains("$1.23"),
+        "{out}"
+    );
+    let out = one_line(181, &env);
+    assert!(!out.contains("last in") && out.contains("$1.23"), "{out}");
+    // Then the project tail: version, memory, always-on size, duration.
+    let out = one_line(130, &env);
+    assert!(!out.contains("$1.23") && !out.contains("CC:"), "{out}");
+    assert!(!out.contains("mem:"), "{out}");
+    assert!(
+        out.contains("on:21kch") && out.contains("dur:1h02m"),
+        "{out}"
+    );
+    let out = one_line(120, &env);
+    assert!(!out.contains("on:21") && out.contains("dur:1h02m"), "{out}");
+}
+
+#[test]
+fn one_line_at_width_80_keeps_the_heads_and_the_git_tail_goes_last() {
+    let out = one_line(80, &rich_env());
     assert_eq!(
-        out, lines.project,
-        "the project row survives even when it alone is too wide"
+        out,
+        "/srv/app | cd:crates/core | Opus 4.6 | ctx 43% (86k/200k) | git: main * ahead:2"
     );
-    // With no project row, the next row up takes its place.
-    let no_project = Lines {
-        project: String::new(),
-        ..fixture_lines(&cfg, &fixture_env())
-    };
-    let out = assemble(&no_project, &cfg, 40);
-    assert!(out.starts_with("ctx 43%"), "{out}");
-    assert!(!out.contains(" | git"), "{out}");
-    assert_eq!(assemble(&Lines::default(), &cfg, 40), "");
+    assert_eq!(visible_len(&out), 79);
+    for gone in ["dur:", "$1.23", "(3h)", "PR#7"] {
+        assert!(!out.contains(gone), "{gone}: {out}");
+    }
 }
 
 #[test]
-fn one_line_drops_by_priority_and_counts_separators() {
-    let lines = Lines {
-        project: "P".repeat(10),
-        ctx: "C".repeat(10),
-        residue: "R".repeat(10),
-        git: "G".repeat(10),
-        five_hour: "F".repeat(10),
-        seven_day: "S".repeat(10),
-        misc: "M".repeat(10),
-    };
+fn one_line_at_width_60_gives_up_the_git_head_then_the_ctx_head() {
+    let env = rich_env();
+    let out = one_line(60, &env);
+    assert_eq!(
+        out,
+        "/srv/app | cd:crates/core | Opus 4.6 | ctx 43% (86k/200k)"
+    );
+    assert_eq!(visible_len(&out), 57);
+    let out = one_line(50, &env);
+    assert_eq!(out, "/srv/app | cd:crates/core | Opus 4.6");
+    assert_eq!(
+        one_line(5, &env),
+        out,
+        "the project head stays however narrow, and the terminal clips it"
+    );
+}
+
+#[test]
+fn one_line_git_tail_drops_the_age_before_the_pr_tag() {
     let cfg = one_line_cfg();
-    let sep = " | ";
+    let mut lines = fixture_lines(&cfg, &rich_env());
+    let full = "git: main (3h) * ahead:2 | PR#7 approved";
+    assert_eq!(lines.git.text(), full);
+    // Leave only the heads and the git tail, so the git tail is the next
+    // thing to move as the width shrinks.
+    lines.residue = Row::default();
+    lines.five_hour = Row::default();
+    lines.seven_day = Row::default();
+    lines.misc = Row::default();
+    lines.ctx.pieces.retain(|p| p.head);
+    lines.project.pieces.retain(|p| p.head);
+    let heads = "/srv/app | cd:crates/core | Opus 4.6 | ctx 43% (86k/200k) | ";
     let show = |w: usize| assemble(&lines, &cfg, w);
-    // N rows of 10 take 10N + 3(N-1) columns: 88 for seven, then 75, 62,
-    // 49, 36, 23, 10.
-    assert_eq!(visible_len(&show(88)), 88);
-    assert!(show(88).contains('R'));
-    // One short: residue goes. Then seven-day, five-hour, misc, git, ctx.
-    assert!(!show(87).contains('R') && show(87).contains('S'));
-    assert!(!show(74).contains('S') && show(74).contains('F'));
-    assert!(!show(61).contains('F') && show(61).contains('M'));
-    assert!(!show(48).contains('M') && show(48).contains('G'));
-    assert!(!show(35).contains('G') && show(35).contains('C'));
+    let w = heads.len() + full.len();
+    assert_eq!(show(w), format!("{heads}{full}"));
     assert_eq!(
-        show(23),
-        format!("{}{}{}", "P".repeat(10), sep, "C".repeat(10))
+        show(w - 1),
+        format!("{heads}git: main * ahead:2 | PR#7 approved"),
+        "the age goes first"
     );
-    // Project last, and never dropped.
-    assert_eq!(show(22), "P".repeat(10));
-    assert_eq!(show(0), "P".repeat(10));
+    assert_eq!(
+        show(w - 6),
+        format!("{heads}git: main * ahead:2"),
+        "then the PR tag"
+    );
+    assert_eq!(
+        show(heads.len() + "git: main * ahead:2".len()),
+        format!("{heads}git: main * ahead:2")
+    );
+    assert_eq!(
+        show(heads.len() + "git: main * ahead:2".len() - 1),
+        "/srv/app | cd:crates/core | Opus 4.6 | ctx 43% (86k/200k)",
+        "and only then the git head"
+    );
+}
+
+#[test]
+fn one_line_never_goes_blank() {
+    let cfg = one_line_cfg();
+    // Without a project row, the ctx head is what is left.
+    let mut lines = fixture_lines(&cfg, &rich_env());
+    lines.project = Row::default();
+    let out = assemble(&lines, &cfg, 10);
+    assert_eq!(out, "ctx 43% (86k/200k)");
+    // With nothing but a misc row, it stays.
+    let only = Lines {
+        misc: Row::whole("effort:high".into(), rank::MISC),
+        ..Lines::default()
+    };
+    assert_eq!(assemble(&only, &cfg, 3), "effort:high");
+    assert_eq!(assemble(&Lines::default(), &cfg, 40), "");
 }
 
 #[test]
 fn one_line_separator_is_dim_when_colour_is_on() {
     let lines = Lines {
-        project: "a".into(),
-        ctx: "b".into(),
+        project: Row::whole("a".into(), KEEP),
+        ctx: Row::whole("b".into(), rank::CTX_HEAD),
         ..Lines::default()
     };
     let cfg = Config {
@@ -2155,20 +2197,19 @@ fn one_line_separator_is_dim_when_colour_is_on() {
 
 #[test]
 fn one_line_width_ignores_colour_codes() {
-    let env = fixture_env();
-    let cfg = Config {
+    let env = rich_env();
+    let colored = Config {
         lines: Some(LineMode::One),
         ..Config::default()
     };
-    let lines = fixture_lines(&cfg, &env);
-    let wide = assemble(&lines, &cfg, 160);
-    let plain_cfg = one_line_cfg();
-    let plain_wide = assemble(&fixture_lines(&plain_cfg, &env), &plain_cfg, 160);
-    assert_eq!(
-        strip_ansi(&wide),
-        plain_wide,
-        "colour on or off, the same pieces survive the same width"
-    );
+    for width in [60, 80, 120, 200] {
+        let with = assemble(&fixture_lines(&colored, &env), &colored, width);
+        assert_eq!(
+            strip_ansi(&with),
+            one_line(width, &env),
+            "colour on or off, the same pieces survive width {width}"
+        );
+    }
 }
 
 // ── auto-compact marker ──
@@ -2262,9 +2303,10 @@ fn ctx_row_shows_the_compact_marker_after_the_size() {
     assert!(
         lines
             .ctx
+            .text()
             .starts_with("ctx 73% (146k/200k) compact in 21k | last in:"),
         "{}",
-        lines.ctx
+        lines.ctx.text()
     );
     // The row stays as it was with the marker off, by extras or by reserve.
     let off = Config {
@@ -2273,9 +2315,12 @@ fn ctx_row_shows_the_compact_marker_after_the_size() {
     };
     let lines = build_lines(&data, &off, &fixture_env());
     assert!(
-        lines.ctx.starts_with("ctx 73% (146k/200k) | last in:"),
+        lines
+            .ctx
+            .text()
+            .starts_with("ctx 73% (146k/200k) | last in:"),
         "{}",
-        lines.ctx
+        lines.ctx.text()
     );
     let off = Config {
         compact_reserve: Some(-1),
@@ -2283,17 +2328,20 @@ fn ctx_row_shows_the_compact_marker_after_the_size() {
     };
     let lines = build_lines(&data, &off, &fixture_env());
     assert!(
-        lines.ctx.starts_with("ctx 73% (146k/200k) | last in:"),
+        lines
+            .ctx
+            .text()
+            .starts_with("ctx 73% (146k/200k) | last in:"),
         "{}",
-        lines.ctx
+        lines.ctx.text()
     );
     // At the 200k+ marker both show, compact first.
     let mut data = data;
     data.exceeds_200k_tokens = Some(true);
     let lines = build_lines(&data, &cfg, &fixture_env());
     assert!(
-        lines.ctx.contains("compact in 21k 200k+ | last"),
+        lines.ctx.text().contains("compact in 21k 200k+ | last"),
         "{}",
-        lines.ctx
+        lines.ctx.text()
     );
 }
