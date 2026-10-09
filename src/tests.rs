@@ -1873,18 +1873,25 @@ fn line_mode_parses_leniently() {
     assert_eq!(LineMode::parse(""), None);
     let d = Config::default();
     assert_eq!(d.line_mode(), LineMode::Multi, "multi is the default");
+    assert_eq!(d.compact_reserve(), 33_000);
 }
 
 #[test]
-fn lines_config_never_breaks_the_rest() {
-    let cfg: Config = serde_json::from_str(r#"{"bar": true, "lines": "one"}"#).unwrap();
+fn lines_and_reserve_config_never_break_the_rest() {
+    let cfg: Config =
+        serde_json::from_str(r#"{"bar": true, "lines": "one", "compact_reserve": 50000}"#).unwrap();
     assert!(cfg.bar);
     assert_eq!(cfg.line_mode(), LineMode::One);
-    let cfg: Config = serde_json::from_str(r#"{"bar": true, "lines": "bogus"}"#).unwrap();
+    assert_eq!(cfg.compact_reserve(), 50_000);
+    let cfg: Config =
+        serde_json::from_str(r#"{"bar": true, "lines": "bogus", "compact_reserve": "lots"}"#)
+            .unwrap();
     assert!(cfg.bar, "a bad value costs only itself");
     assert_eq!(cfg.line_mode(), LineMode::Multi);
-    let cfg: Config = serde_json::from_str(r#"{"lines": 3}"#).unwrap();
+    assert_eq!(cfg.compact_reserve(), 33_000);
+    let cfg: Config = serde_json::from_str(r#"{"lines": 3, "compact_reserve": 1.5}"#).unwrap();
     assert_eq!(cfg.line_mode(), LineMode::Multi);
+    assert_eq!(cfg.compact_reserve(), 33_000);
 }
 
 /// A hook payload that fills every row. The rate-limit windows and the
@@ -2161,4 +2168,132 @@ fn one_line_width_ignores_colour_codes() {
         strip_ansi(&wide),
         plain_wide,
         "colour on or off, the same pieces survive the same width"
-    );}
+    );
+}
+
+// ── auto-compact marker ──
+
+#[test]
+fn compact_marker_thresholds() {
+    let cfg = plain();
+    let cap = 200_000;
+    let reserve = 33_000;
+    let marker = |cur: i64| compact_marker(cap, cur, reserve, &cfg);
+    // Compaction fires at 167k; the marker appears within 40k (20%) of it.
+    assert_eq!(marker(50_000), None, "far away");
+    assert_eq!(marker(126_999), None, "40,001 tokens left");
+    assert_eq!(marker(127_000), None, "exactly 20% of the window left");
+    assert_eq!(marker(127_001).as_deref(), Some("compact in 40k"));
+    assert_eq!(marker(140_000).as_deref(), Some("compact in 27k"));
+    assert_eq!(
+        marker(166_500).as_deref(),
+        Some("compact in 1k"),
+        "never 0k"
+    );
+    assert_eq!(marker(166_999).as_deref(), Some("compact in 1k"));
+    assert_eq!(marker(167_000).as_deref(), Some("compact!"), "at zero");
+    assert_eq!(marker(190_000).as_deref(), Some("compact!"), "past it");
+}
+
+#[test]
+fn compact_marker_stays_quiet_when_it_cannot_say_anything() {
+    let cfg = plain();
+    assert_eq!(compact_marker(0, 150_000, 33_000, &cfg), None, "cap 0");
+    assert_eq!(compact_marker(-5, 150_000, 33_000, &cfg), None);
+    assert_eq!(compact_marker(200_000, 0, 33_000, &cfg), None, "no usage");
+    assert_eq!(compact_marker(200_000, -1, 33_000, &cfg), None);
+    assert_eq!(
+        compact_marker(200_000, 190_000, -1, &cfg),
+        None,
+        "a negative reserve switches it off"
+    );
+    assert_eq!(
+        compact_marker(30_000, 20_000, 33_000, &cfg),
+        None,
+        "a reserve as big as the window leaves no point to warn about"
+    );
+    assert_eq!(compact_marker(200_000, 190_000, 200_000, &cfg), None);
+}
+
+#[test]
+fn compact_marker_scales_with_the_window_and_the_reserve() {
+    let cfg = plain();
+    // 1M window: compaction at 967k, warn inside the last 200k.
+    assert_eq!(compact_marker(1_000_000, 700_000, 33_000, &cfg), None);
+    assert_eq!(
+        compact_marker(1_000_000, 800_000, 33_000, &cfg).as_deref(),
+        Some("compact in 167k")
+    );
+    // A bigger reserve moves the point down.
+    assert_eq!(
+        compact_marker(200_000, 140_000, 50_000, &cfg).as_deref(),
+        Some("compact in 10k")
+    );
+    // Reserve 0: compaction at the very end of the window.
+    assert_eq!(
+        compact_marker(200_000, 170_000, 0, &cfg).as_deref(),
+        Some("compact in 30k")
+    );
+}
+
+#[test]
+fn compact_marker_is_amber_when_colour_is_on() {
+    let cfg = Config::default();
+    assert_eq!(
+        compact_marker(200_000, 140_000, 33_000, &cfg),
+        Some(format!("{}compact in 27k{}", AMBER, RESET))
+    );
+    assert_eq!(
+        compact_marker(200_000, 170_000, 33_000, &cfg),
+        Some(format!("{}compact!{}", AMBER, RESET))
+    );
+}
+
+#[test]
+fn ctx_row_shows_the_compact_marker_after_the_size() {
+    // 120k read from cache plus the baseline the ctx figure adds: 146k.
+    let json = FIXTURE.replace(
+        "\"cache_read_input_tokens\":60000",
+        "\"cache_read_input_tokens\":120000",
+    );
+    let data: Input = serde_json::from_str(&json).unwrap();
+    let cfg = plain();
+    let lines = build_lines(&data, &cfg, &fixture_env());
+    assert!(
+        lines
+            .ctx
+            .starts_with("ctx 73% (146k/200k) compact in 21k | last in:"),
+        "{}",
+        lines.ctx
+    );
+    // The row stays as it was with the marker off, by extras or by reserve.
+    let off = Config {
+        extras: false,
+        ..plain()
+    };
+    let lines = build_lines(&data, &off, &fixture_env());
+    assert!(
+        lines.ctx.starts_with("ctx 73% (146k/200k) | last in:"),
+        "{}",
+        lines.ctx
+    );
+    let off = Config {
+        compact_reserve: Some(-1),
+        ..plain()
+    };
+    let lines = build_lines(&data, &off, &fixture_env());
+    assert!(
+        lines.ctx.starts_with("ctx 73% (146k/200k) | last in:"),
+        "{}",
+        lines.ctx
+    );
+    // At the 200k+ marker both show, compact first.
+    let mut data = data;
+    data.exceeds_200k_tokens = Some(true);
+    let lines = build_lines(&data, &cfg, &fixture_env());
+    assert!(
+        lines.ctx.contains("compact in 21k 200k+ | last"),
+        "{}",
+        lines.ctx
+    );
+}

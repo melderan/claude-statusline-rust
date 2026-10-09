@@ -195,7 +195,7 @@ fn first_renders_of_a_new_file_all_write() {
 }
 
 #[test]
-fn lines_env_reaches_the_render() {
+fn lines_and_compact_env_reach_the_render() {
     let dir = fresh_dir("linesenv");
     let (_, multi, _) = run(&dir, &[], &[], HOOK);
     assert_eq!(multi.lines().count(), 2, "{multi:?}");
@@ -215,5 +215,11 @@ fn lines_env_reaches_the_render() {
     let (_, junk, _) = run(&dir, &[("CSR_LINES", "sideways")], &[], HOOK);
     assert_eq!(junk, multi, "an unknown value changes nothing");
 
+    let (_, marked, _) = run(&dir, &[("CSR_COMPACT_RESERVE", "100000")], &[], HOOK);
+    assert!(marked.contains("compact!"), "{marked}");
+    let (_, off, _) = run(&dir, &[("CSR_COMPACT_RESERVE", "-1")], &[], HOOK);
+    assert_eq!(off, multi, "a negative reserve is off");
+    let (_, junk, _) = run(&dir, &[("CSR_COMPACT_RESERVE", "lots")], &[], HOOK);
+    assert_eq!(junk, multi, "an unparsable reserve is ignored");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -58,6 +58,13 @@ pub(crate) struct Config {
     /// Anything else is ignored rather than failing the whole config.
     #[serde(default, deserialize_with = "lenient")]
     pub(crate) lines: Option<LineMode>,
+    /// Tokens Claude Code keeps free when it compacts the context on its
+    /// own (default 33000). The ctx row shows `compact in Nk` when the
+    /// context is within 20% of the window of that point. A negative value
+    /// switches the marker off. `CSR_COMPACT_RESERVE` overrides; a value
+    /// that is not a whole number is ignored.
+    #[serde(default, deserialize_with = "lenient")]
+    pub(crate) compact_reserve: Option<i64>,
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -98,6 +105,7 @@ impl Default for Config {
             extras: true,
             voice: true,
             lines: None,
+            compact_reserve: None,
         }
     }
 }
@@ -139,6 +147,11 @@ impl Config {
         {
             cfg.lines = Some(mode);
         }
+        if let Ok(v) = std::env::var("CSR_COMPACT_RESERVE")
+            && let Ok(n) = v.trim().parse::<i64>()
+        {
+            cfg.compact_reserve = Some(n);
+        }
         cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);
         cfg
@@ -146,6 +159,10 @@ impl Config {
 
     pub(crate) fn line_mode(&self) -> LineMode {
         self.lines.unwrap_or_default()
+    }
+
+    pub(crate) fn compact_reserve(&self) -> i64 {
+        self.compact_reserve.unwrap_or(COMPACT_RESERVE_DEFAULT)
     }
 
     /// `CSR_METRICS_DB` overrides `metrics_db` from the file; a blank value is

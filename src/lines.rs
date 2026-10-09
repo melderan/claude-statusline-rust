@@ -218,7 +218,7 @@ fn project_line(
     out
 }
 
-/// ctx [bar] pct (used/cap) [200k+] [| last in/out].
+/// ctx [bar] pct (used/cap) [compact marker] [200k+] [| last in/out].
 /// Empty when the window size is unknown.
 fn ctx_line(data: &Input, cfg: &Config, env: &Env, num: &CtxNumbers) -> String {
     let rst = reset(cfg);
@@ -248,6 +248,11 @@ fn ctx_line(data: &Input, cfg: &Config, env: &Env, num: &CtxNumbers) -> String {
         current_tok / 1000,
         cap / 1000
     );
+    if cfg.extras
+        && let Some(marker) = compact_marker(cap, current_tok, cfg.compact_reserve(), cfg)
+    {
+        let _ = write!(out, " {}", marker);
+    }
     if cfg.extras && data.exceeds_200k_tokens == Some(true) {
         let _ = write!(out, " {}200k+{}", c(cfg, AMBER), rst);
     }
@@ -479,4 +484,50 @@ fn assemble_one(lines: &Lines, cfg: &Config, width: usize) -> String {
         .map(|(s, _)| s.as_str())
         .collect::<Vec<_>>()
         .join(&sep)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Auto-compact marker
+// ─────────────────────────────────────────────────────────────────────
+
+/// Tokens Claude Code keeps free when it compacts on its own. Default for
+/// `compact_reserve`, following claude-powerline's compaction buffer.
+pub(crate) const COMPACT_RESERVE_DEFAULT: i64 = 33_000;
+
+/// `compact in 12k` once the context is within 20% of the window of the
+/// point where Claude Code compacts by itself; `compact!` at or past it.
+/// None further out, with no usage, with an unknown window, when the
+/// reserve is negative (the way to switch it off) or is not smaller than
+/// the window.
+///
+/// The compaction point is `cap - reserve`. As of 2026-10-08 the statusline
+/// payload carries no field for it: the documented `context_window` fields
+/// are the sizes, the percentages and `current_usage`, and 20 payloads
+/// captured from a live session had none either (no key containing
+/// "compact" anywhere). So the point comes from `compact_reserve`. If a
+/// threshold field ever appears, replace `reserve` with it here.
+pub(crate) fn compact_marker(
+    cap: i64,
+    current_tok: i64,
+    reserve: i64,
+    cfg: &Config,
+) -> Option<String> {
+    if cap <= 0 || current_tok <= 0 || reserve < 0 || reserve >= cap {
+        return None;
+    }
+    let left = (cap - reserve) - current_tok;
+    let rst = reset(cfg);
+    if left <= 0 {
+        return Some(format!("{}compact!{}", c(cfg, AMBER), rst));
+    }
+    if left >= cap / 5 {
+        return None;
+    }
+    // Round up so the last few hundred tokens read 1k, never 0k.
+    Some(format!(
+        "{}compact in {}k{}",
+        c(cfg, AMBER),
+        (left + 999) / 1000,
+        rst
+    ))
 }
