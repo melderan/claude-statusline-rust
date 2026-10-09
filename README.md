@@ -151,13 +151,15 @@ effort:high | "refactor auth" | voice: narrator (en_US-demo-medium) 2.0x
 
 Joined with ` | `, in this order, each only when present: `effort:<level>` (`effort.level`), `fast` (`fast_mode`), `think:off` (`thinking.enabled` is false), the session name in quotes (`session_name`, cut at 32 characters), `wt:<name>` (`worktree.name`), the voice segment (see Compatibility), `[NORMAL]` (`vim.mode`) and `{name}` (`agent.name`).
 
+When this render's metrics row was skipped because the database was busy or locked, `db:locked` (amber) comes first on this line, ahead of the tags; see Metrics database.
+
 ## One-line mode
 
 ```
 ~/code/my-app | Opus 4.6 | CC:2.1.0 | dur:1h02m | ctx 43% (86k/200k) | $1.23 | git: main (3h) *
 ```
 
-Set `lines` to `one` (or `CSR_LINES=one`) and every line above is joined into a single row with ` | `, in the same order. When the row is wider than `COLUMNS`, pieces are dropped from the least important up until it fits: the residue numbers first, then the 7d and 5h windows, the activity line, the misc tags, the tail of the ctx line (cache, then `last in/out`, then cost), the tail of the project line (version, memory, always-on size, duration), and the tail of the git line (age, then PR state). The project path and model, the ctx percentage and the branch stay the longest; the project path is never dropped, so on a very narrow terminal it is clipped rather than lost. The default `multi` prints one line per kind of information as shown above.
+Set `lines` to `one` (or `CSR_LINES=one`) and every line above is joined into a single row with ` | `, in the same order. When the row is wider than `COLUMNS`, pieces are dropped from the least important up until it fits: the residue numbers first, then the 7d and 5h windows, the activity line, the misc tags, the `db:locked` marker, the tail of the ctx line (cache, then `last in/out`, then cost), the tail of the project line (version, memory, always-on size, duration), and the tail of the git line (age, then PR state). The project path and model, the ctx percentage and the branch stay the longest; the project path is never dropped, so on a very narrow terminal it is clipped rather than lost. The default `multi` prints one line per kind of information as shown above.
 
 ## Configuration
 
@@ -181,9 +183,9 @@ Settings come from `~/.config/claude-statusline-rust/config.json`, then environm
 
 Each render writes one row to a local SQLite file, so the residue line has history to read and you can chart your own usage. A row holds the timestamp, project directory, branch, model, session and prompt ids, context tokens, the hook's input and output token counts, window size and percentage, session cost, both rate-limit percentages and reset times, and the always-on character count with the list of files behind it. A render that changes none of the token counts, rate-limit percentages or always-on count writes nothing. The file stays on your machine; nothing reads it except this program and tools you point at it.
 
-By default the file is `~/.config/dbg/statusline-metrics.db`, in WAL mode. Any SQLite failure leaves the displayed line untouched.
+By default the file is `~/.config/dbg/statusline-metrics.db`, in WAL mode. A SQLite failure leaves the displayed line as it was, with one exception: when the database is busy or locked, at open or at insert, the row is skipped and the misc line starts with `db:locked`, so a stuck lock does not go unnoticed. The marker clears on the first render that can write. It does not appear for other failures, such as a read-only file or a full disk; those only print to stderr when `metrics_db` is set.
 
-Set `metrics_db` (or `CSR_METRICS_DB`) to use another file, for example one on a network or virtual-filesystem mount that rejects SQLite's default locks. `~`, `~/x` and relative paths resolve from `$HOME`, never from the working directory. That file is opened with SQLite's `unix-dotfile` VFS and a rollback journal, so locking is a `<file>.lock` directory. A render waits 50 ms for it; on timeout it skips its row and prints one line to stderr. It never removes a lock, since a lock that looks stale may belong to a slow writer.
+Set `metrics_db` (or `CSR_METRICS_DB`) to use another file, for example one on a network or virtual-filesystem mount that rejects SQLite's default locks. `~`, `~/x` and relative paths resolve from `$HOME`, never from the working directory. That file is opened with SQLite's `unix-dotfile` VFS and a rollback journal, so locking is a `<file>.lock` directory. A render waits 50 ms for it; on timeout it skips its row, shows `db:locked` and prints one line to stderr. It never removes a lock, since a lock that looks stale may belong to a slow writer.
 
 `claude-statusline-rust --flush` copies local rows into a shared recorder database: a SQLite file that several machines or containers write into. It copies only rows newer than the last flush, in batches, and is safe to repeat. It needs `CSR_RECORDER_DB` (the recorder path) and an instance name in `CSR_ROOM`, falling back to `SANDBOX_NAME`; without either it prints a message and does nothing. It always exits 0 so it can run from a Stop hook. It creates a `measures` table in the recorder and refuses an existing one whose unique key differs.
 
