@@ -21,6 +21,42 @@ pub(crate) fn metrics_db_path(cfg: &Config, home: &str) -> DbResult<(String, boo
 /// How long a render waits for the local file: a keystroke is behind it.
 pub(crate) const RENDER_PATIENCE: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long an opener of a brand-new file waits for each lock. The first
+/// opener creates the schema in one write transaction; on a mount where
+/// fsync is slow that, plus the other first renders' rows queued behind it,
+/// can take longer than RENDER_PATIENCE, and every first render that gave
+/// up would lose its row. Once the file has a header no render waits this
+/// long again.
+pub(crate) const FIRST_LIFE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a file without a header still counts as brand new. A first
+/// opener killed mid-creation can leave an empty file under a lock that
+/// nobody removes; after this window renders on it go back to
+/// RENDER_PATIENCE instead of waiting FIRST_LIFE_PATIENCE every time.
+pub(crate) const FIRST_LIFE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A file nobody has created a database in yet: missing, or shorter than
+/// SQLite's 100-byte header and modified within FIRST_LIFE_WINDOW. Read
+/// without any lock, so it never waits.
+pub(crate) fn is_brand_new(path: &str) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    if meta.len() >= 100 {
+        return false;
+    }
+    let now = std::time::SystemTime::now();
+    meta.modified()
+        .map(|m| {
+            let age = now
+                .duration_since(m)
+                .or_else(|_| m.duration_since(now))
+                .unwrap_or_default();
+            age < FIRST_LIFE_WINDOW
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn open_metrics_db(cfg: &Config, home: &str) -> DbResult<Connection> {
     open_metrics_db_with(cfg, home, RENDER_PATIENCE)
 }
@@ -67,6 +103,15 @@ pub(crate) fn open_metrics_at(
     shared: bool,
     patience: std::time::Duration,
 ) -> DbResult<Connection> {
+    // Checked before the open, which creates the file: the openers of a
+    // brand-new file wait up to FIRST_LIFE_PATIENCE per lock, for this one
+    // connection only, so the schema step and the first rows queued behind
+    // it all land. A file that already has a header gets `patience`.
+    let patience = if is_brand_new(path) {
+        patience.max(FIRST_LIFE_PATIENCE)
+    } else {
+        patience
+    };
     let conn = if shared {
         Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), "unix-dotfile")?
     } else {
