@@ -51,7 +51,7 @@ fn run(
 #[test]
 fn locked_shared_db_keeps_the_display_and_warns_once() {
     let dir = fresh_dir("locked");
-    let db = dir.join("room.sqlite");
+    let db = dir.join("local.sqlite");
     let dbs = db.to_string_lossy().to_string();
     let (code, unlocked, err) = run(&dir, &[("CSR_METRICS_DB", &dbs)], &[], HOOK);
     assert_eq!(code, 0);
@@ -85,7 +85,7 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
     assert_eq!(code, 0);
     assert_eq!(out, "");
     assert!(err.contains("CSR_ROOM"), "{err}");
-    assert!(!rec.exists(), "no room, no recorder file");
+    assert!(!rec.exists(), "no instance name, no recorder file");
 
     // A plain render with the flush env set does not flush.
     let (code, out, _) = run(
@@ -104,7 +104,7 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
         &[
             ("CSR_RECORDER_DB", &recs),
             ("CSR_ROOM", "  "),
-            ("SANDBOX_NAME", "sbx--x--room"),
+            ("SANDBOX_NAME", "name-from-env"),
         ],
         &["--flush"],
         "",
@@ -123,7 +123,7 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
         "unix-dotfile",
     )
     .unwrap();
-    let rooms: Vec<String> = conn
+    let names: Vec<String> = conn
         .prepare("SELECT DISTINCT room FROM measures")
         .unwrap()
         .query_map([], |r| r.get(0))
@@ -131,15 +131,15 @@ fn flush_needs_its_env_and_a_render_never_flushes() {
         .map(|r| r.unwrap())
         .collect();
     assert_eq!(
-        rooms,
-        vec!["sbx--x--room"],
-        "blank CSR_ROOM falls back to the full sandbox name"
+        names,
+        vec!["name-from-env"],
+        "blank CSR_ROOM falls back to the full SANDBOX_NAME"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn first_renders_of_a_rooms_life_all_write() {
+fn first_renders_of_a_new_file_all_write() {
     // PRAGMA journal_mode=WAL on a brand-new file answers BUSY without the
     // busy handler, so concurrent first renders used to skip their rows.
     // Separate connections in one process share SQLite's lock state and do
@@ -192,4 +192,73 @@ fn first_renders_of_a_rooms_life_all_write() {
         assert!(errs.is_empty(), "round {round}: {errs:?}");
         assert_eq!(rows, 8, "round {round}: every first render writes its row");
     }
+}
+
+#[test]
+fn lines_and_compact_env_reach_the_render() {
+    let dir = fresh_dir("linesenv");
+    let (_, multi, _) = run(&dir, &[], &[], HOOK);
+    assert_eq!(multi.lines().count(), 2, "{multi:?}");
+    assert!(
+        !multi.contains("compact"),
+        "far from the threshold: {multi}"
+    );
+
+    let (code, one, _) = run(&dir, &[("CSR_LINES", "one")], &[], HOOK);
+    assert_eq!(code, 0);
+    assert_eq!(one.lines().count(), 1, "{one:?}");
+    assert!(one.starts_with("/x | Fable | ctx "), "{one}");
+
+    let (_, narrow, _) = run(&dir, &[("CSR_LINES", "one"), ("COLUMNS", "20")], &[], HOOK);
+    assert_eq!(narrow, "/x | Fable", "the project row alone, never blank");
+
+    let (_, junk, _) = run(&dir, &[("CSR_LINES", "sideways")], &[], HOOK);
+    assert_eq!(junk, multi, "an unknown value changes nothing");
+
+    let (_, marked, _) = run(&dir, &[("CSR_COMPACT_RESERVE", "100000")], &[], HOOK);
+    assert!(marked.contains("compact!"), "{marked}");
+    let (_, off, _) = run(&dir, &[("CSR_COMPACT_RESERVE", "-1")], &[], HOOK);
+    assert_eq!(off, multi, "a negative reserve is off");
+    let (_, junk, _) = run(&dir, &[("CSR_COMPACT_RESERVE", "lots")], &[], HOOK);
+    assert_eq!(junk, multi, "an unparsable reserve is ignored");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn activity_line_renders_from_the_transcript_and_a_missing_one_costs_nothing() {
+    let dir = fresh_dir("activity");
+    let t = dir.join("session.jsonl");
+    std::fs::write(
+        &t,
+        concat!(
+            r#"{"type":"user","origin":{"kind":"human"},"message":{"content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let with = |path: &str| HOOK.replacen('{', &format!(r#"{{"transcript_path":"{path}","#), 1);
+
+    let (code, out, err) = run(&dir, &[], &[], &with(&t.to_string_lossy()));
+    assert_eq!(code, 0);
+    assert!(out.contains("\ntools: Bash x1"), "{out}");
+    assert_eq!(err, "");
+
+    let (code, hidden, _) = run(
+        &dir,
+        &[("CSR_ACTIVITY", "0")],
+        &[],
+        &with(&t.to_string_lossy()),
+    );
+    assert_eq!(code, 0);
+    assert!(!hidden.contains("tools:"), "{hidden}");
+
+    let missing = dir.join("missing.jsonl");
+    let (code, out, err) = run(&dir, &[], &[], &with(&missing.to_string_lossy()));
+    assert_eq!(code, 0, "a missing transcript never fails the render");
+    assert!(out.contains("ctx "), "{out}");
+    assert!(!out.contains("tools:"), "{out}");
+    assert_eq!(err, "");
+    let _ = std::fs::remove_dir_all(&dir);
 }

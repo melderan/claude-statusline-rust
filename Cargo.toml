@@ -2,6 +2,10 @@
 name = "claude-statusline-rust"
 version = "0.1.0"
 edition = "2024"
+description = "A fast status line for Claude Code: context use, prompt cache, git state and rate-limit pace, with no network access"
+license = "Apache-2.0"
+repository = "https://github.com/melderan/claude-statusline-rust"
+readme = "README.md"
 publish = false
 
 [dependencies]
