@@ -96,7 +96,8 @@ awk -v v="$version" -v d="$today" '
   /^## \[Unreleased\]/ { print; print ""; print "## [" v "] - " d; next }
   { print }
 ' CHANGELOG.md >"$tmp"
-mv "$tmp" CHANGELOG.md
+# Write in place: a temp file is created mode 600 and mv would carry that mode over.
+cat "$tmp" >CHANGELOG.md && rm -f "$tmp"
 act "CHANGELOG.md: $entries entries moved from [Unreleased] to [$version] - $today"
 
 # ── Cargo.toml and Cargo.lock ──
@@ -106,7 +107,7 @@ awk -v v="$version" '
   in_pkg && /^version[[:space:]]*=/ && !done { print "version = \"" v "\""; done = 1; next }
   { print }
 ' Cargo.toml >"$tmp"
-mv "$tmp" Cargo.toml
+cat "$tmp" >Cargo.toml && rm -f "$tmp"
 act "Cargo.toml: version = \"$version\""
 cargo update --workspace --quiet
 act "Cargo.lock: updated for the new version"

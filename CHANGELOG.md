@@ -26,6 +26,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Fixed
 
+- The release script no longer leaves `CHANGELOG.md` and `Cargo.toml` with mode 600: it writes them in place instead of moving a temp file over them.
 - Ahead/behind counts across merge commits now match `git rev-list --left-right --count`.
 - The metrics duplicate check compares against this session's last row, not the last row of any session.
 - The memory directory slug uses the same rule as Claude Code, so project paths with a dot or an underscore find their memory directory.
