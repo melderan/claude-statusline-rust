@@ -262,3 +262,26 @@ fn activity_line_renders_from_the_transcript_and_a_missing_one_costs_nothing() {
     assert_eq!(err, "");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn version_and_help_answer_without_reading_stdin() {
+    let dir = fresh_dir("version");
+    let (code, out, err) = run(&dir, &[], &["--version"], "");
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        format!("claude-statusline-rust {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(err, "");
+    let (code, out, _) = run(&dir, &[], &["-V"], "not json");
+    assert_eq!(code, 0);
+    assert!(out.starts_with("claude-statusline-rust "));
+    let (code, out, err) = run(&dir, &[], &["--help"], "");
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("--flush") && out.contains("--version"),
+        "{out}"
+    );
+    assert_eq!(err, "");
+    let _ = std::fs::remove_dir_all(&dir);
+}

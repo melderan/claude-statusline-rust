@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Cut a release: check, move the changelog, bump the version, test, commit, tag.
+# Usage: scripts/release X.Y.Z[-rc.N] [--push] [--allow-branch] [--no-sign]
+# Nothing is pushed unless --push is given. See RELEASING.md and VERSIONING.md.
+set -euo pipefail
+
+usage() {
+  sed -n '2,4p' "$0" | sed 's/^# //'
+  exit 2
+}
+
+version=""
+push=0
+allow_branch=0
+sign="-s"
+for arg in "$@"; do
+  case "$arg" in
+    --push) push=1 ;;
+    --allow-branch) allow_branch=1 ;;
+    --no-sign) sign="-a" ;;
+    -h|--help) usage ;;
+    -*) echo "release: unknown flag $arg" >&2; usage ;;
+    *) [ -z "$version" ] || usage; version="$arg" ;;
+  esac
+done
+[ -n "$version" ] || usage
+
+actions=0
+say() { printf 'release: %s\n' "$*"; }
+act() { actions=$((actions + 1)); printf 'release: %s\n' "$*"; }
+fail() { printf 'release: %s\n' "$*" >&2; exit 1; }
+
+semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+[[ "$version" =~ $semver ]] || fail "$version is not X.Y.Z or X.Y.Z-rc.N (no leading zeros, no other suffix)"
+tag="v$version"
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+# ── The tree, the branch, the upstream ──
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$branch" != "main" ] && [ "$allow_branch" -eq 0 ]; then
+  fail "on branch $branch; releases are cut on main (or pass --allow-branch for a rehearsal)"
+fi
+[ -z "$(git status --porcelain)" ] || fail "the working tree is not clean"
+git fetch -q origin
+upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+[ -n "$upstream" ] || fail "$branch has no upstream to compare against"
+[ "$(git rev-parse HEAD)" = "$(git rev-parse "$upstream")" ] || fail "HEAD is not at $upstream; pull or push first"
+say "branch $branch at $(git rev-parse --short HEAD), clean, level with $upstream"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  fail "tag $tag already exists; a version is never released twice"
+fi
+
+# ── The number: exactly one component up, the ones below it back to zero ──
+current="$(awk '/^\[/ { in_pkg = ($0 == "[package]") } in_pkg && /^version[[:space:]]*=/ { gsub(/.*=[[:space:]]*"|".*/, ""); print; exit }' Cargo.toml)"
+[ -n "$current" ] || fail "could not read version from the [package] table in Cargo.toml"
+IFS=.- read -r cmaj cmin cpat crest <<<"${current//-rc./-}"
+IFS=.- read -r nmaj nmin npat nrest <<<"${version//-rc./-}"
+valid=0
+if [ "$current" = "0.0.0" ]; then
+  valid=1
+elif [ -n "$crest" ] && [ "$nmaj.$nmin.$npat" = "$cmaj.$cmin.$cpat" ]; then
+  # From an rc: the final release of the same number, or the next rc.
+  if [ -z "$nrest" ] || [ "$nrest" -eq $((crest + 1)) ]; then valid=1; fi
+elif [ "$nmaj" -eq $((cmaj + 1)) ] && [ "$nmin" -eq 0 ] && [ "$npat" -eq 0 ]; then
+  valid=1
+elif [ "$nmaj" -eq "$cmaj" ] && [ "$nmin" -eq $((cmin + 1)) ] && [ "$npat" -eq 0 ]; then
+  valid=1
+elif [ "$nmaj" -eq "$cmaj" ] && [ "$nmin" -eq "$cmin" ] && [ "$npat" -eq $((cpat + 1)) ]; then
+  valid=1
+fi
+if [ "$valid" -eq 1 ] && [ -n "$nrest" ] && [ -z "$crest" ] && [ "$nrest" -ne 1 ]; then
+  valid=0
+fi
+[ "$valid" -eq 1 ] || fail "$version is not a single step from $current (next: PATCH, MINOR, MAJOR, or -rc.1 of one of those)"
+say "version $current -> $version"
+
+# ── The changelog: Unreleased must have entries ──
+[ -f CHANGELOG.md ] || fail "CHANGELOG.md is missing"
+grep -q '^## \[Unreleased\]' CHANGELOG.md || fail "CHANGELOG.md has no [Unreleased] section"
+entries="$(awk '/^## \[Unreleased\]/ { on = 1; next } /^## \[/ { on = 0 } on && /^- / { n++ } END { print n + 0 }' CHANGELOG.md)"
+[ "$entries" -gt 0 ] || fail "[Unreleased] has no entries; nothing to release"
+grep -q "^## \[$version\]" CHANGELOG.md && fail "CHANGELOG.md already has a [$version] heading"
+today="$(date -u +%Y-%m-%d)"
+tmp="$(mktemp)"
+awk -v v="$version" -v d="$today" '
+  /^## \[Unreleased\]/ { print; print ""; print "## [" v "] - " d; next }
+  { print }
+' CHANGELOG.md >"$tmp"
+mv "$tmp" CHANGELOG.md
+act "CHANGELOG.md: $entries entries moved from [Unreleased] to [$version] - $today"
+
+# ── Cargo.toml and Cargo.lock ──
+tmp="$(mktemp)"
+awk -v v="$version" '
+  /^\[/ { in_pkg = ($0 == "[package]") }
+  in_pkg && /^version[[:space:]]*=/ && !done { print "version = \"" v "\""; done = 1; next }
+  { print }
+' Cargo.toml >"$tmp"
+mv "$tmp" Cargo.toml
+act "Cargo.toml: version = \"$version\""
+cargo update --workspace --quiet
+act "Cargo.lock: updated for the new version"
+
+# ── Tests on the exact tree that ships ──
+say "cargo test --release --locked"
+cargo test --release --locked --quiet
+say "tests passed"
+
+# ── Commit and tag ──
+git add CHANGELOG.md Cargo.toml Cargo.lock
+git commit -q -m "release: $tag"
+act "commit $(git rev-parse --short HEAD) release: $tag"
+git tag "$sign" "$tag" -m "claude-statusline-rust $version"
+kind="$(git cat-file -t "$tag")"
+[ "$kind" = "tag" ] || fail "tag $tag is not annotated"
+if [ "$sign" = "-s" ] && ! git cat-file tag "$tag" | grep -q -- '-----BEGIN .*SIGNATURE-----'; then
+  fail "tag $tag carries no signature"
+fi
+act "tag $tag (annotated$([ "$sign" = "-s" ] && echo ', signed'))"
+
+if [ "$push" -eq 1 ]; then
+  git push origin "$branch"
+  git push origin "$tag"
+  act "pushed $branch and $tag to origin"
+else
+  say "not pushed; to publish:"
+  say "  git push origin $branch && git push origin $tag"
+fi
+say "$actions action(s) done"

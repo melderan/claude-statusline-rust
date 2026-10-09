@@ -46,6 +46,10 @@ uninstall:
     rm -f {{ install_dir }}/{{ binary_name }}
     @echo "Removed {{ install_dir }}/{{ binary_name }}"
 
+# Cut a release: just tag X.Y.Z [--push] (see RELEASING.md)
+tag version *flags:
+    scripts/release {{ version }} {{ flags }}
+
 # Run tests
 test:
     cargo test

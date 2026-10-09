@@ -32,6 +32,36 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --release --all-targets -- -D warnings
 
+  changelog:
+    name: changelog entry
+    if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'no-changelog')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: A change to the code needs a line under [Unreleased]
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "$BASE" "$HEAD")"
+          if ! printf '%s\n' "$changed" | grep -qE '^(src/|tests/|Cargo\.toml$)'; then
+            echo "No code change; no changelog entry needed."
+            exit 0
+          fi
+          if ! printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "::error::This pull request changes code but not CHANGELOG.md. Add your lines under [Unreleased] (see VERSIONING.md), or add the no-changelog label."
+            exit 1
+          fi
+          added="$(git diff "$BASE" "$HEAD" -- CHANGELOG.md | grep -cE '^\+- ' || true)"
+          if [ "$added" -eq 0 ]; then
+            echo "::error::CHANGELOG.md changed but no entry line (starting with '- ') was added."
+            exit 1
+          fi
+          echo "CHANGELOG.md gained $added entry line(s)."
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest
