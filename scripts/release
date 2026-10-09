@@ -17,7 +17,7 @@ for arg in "$@"; do
   case "$arg" in
     --push) push=1 ;;
     --allow-branch) allow_branch=1 ;;
-    --no-sign) sign="-a" ;;
+    --no-sign) sign="-a" ;;   # a rehearsal: annotated, unsigned even where tag.gpgSign is set
     -h|--help) usage ;;
     -*) echo "release: unknown flag $arg" >&2; usage ;;
     *) [ -z "$version" ] || usage; version="$arg" ;;
@@ -136,7 +136,10 @@ say "tests passed"
 git add CHANGELOG.md Cargo.toml Cargo.lock
 git commit -q -m "release: $tag"
 act "commit $(git rev-parse --short HEAD) release: $tag"
-git tag "$sign" "$tag" -m "claude-statusline-rust $version"
+# -a alone still signs when tag.gpgSign is set; a rehearsal says --no-sign outright.
+tagopts=("$sign")
+[ "$sign" = "-a" ] && tagopts+=(--no-sign)
+git tag "${tagopts[@]}" "$tag" -m "claude-statusline-rust $version"
 kind="$(git cat-file -t "$tag")"
 [ "$kind" = "tag" ] || fail "tag $tag is not annotated"
 if [ "$sign" = "-s" ] && ! git cat-file tag "$tag" | grep -q -- '-----BEGIN .*SIGNATURE-----'; then
