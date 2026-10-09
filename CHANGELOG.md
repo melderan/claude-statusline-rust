@@ -10,9 +10,16 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Fixed
 
+- The first renders of a brand-new shared metrics file (`CSR_METRICS_DB`) no longer skip rows while the first of them creates the table: a metrics file that does not exist yet, or is still empty and under 10 seconds old, gets up to 1 second per lock instead of 50 ms. A file that exists keeps the 50 ms. The default local file gets the same first-life wait; it was not losing rows.
+- A `--flush` stopped by a local value of the wrong type names the value's real type, without the column index.
+- A `--flush` that finds the recorder locked no longer suggests the file is in WAL mode because of an empty `-wal` file beside it.
 - Always-on count: an indented line directly after a paragraph line is a continuation of the paragraph, not an indented code block.
 - Always-on count: a closing code fence may be indented at most three spaces and must be at least as long as the opening fence, with the same character.
 - Always-on count: `always_on_files` lists cleaned paths, with no `./` segments or doubled slashes.
+
+### Changed
+
+- README: the flush's 3-second patience is per lock, so a flush that meets busy files at two steps can take about 6 seconds.
 
 ## [1.0.0] - 2026-10-09
 

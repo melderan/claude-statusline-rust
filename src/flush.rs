@@ -12,7 +12,10 @@ use crate::*;
 // shared mount, so one place holds the rows of every instance. The flush is
 // the only path that writes to that file. It never removes a lock: a recorder
 // it cannot open or lock within the busy timeout means one stderr line and
-// exit 0, so a Stop hook is never blocked and nothing is forced.
+// exit 0, so a Stop hook is never blocked and nothing is forced. The busy
+// timeout bounds each lock wait, not the whole flush: the local file and
+// the recorder are locked in separate steps, so a flush that meets a busy
+// file at two steps can take about twice RECORDER_BUSY_TIMEOUT.
 //
 // Recorder schema: measures(id, ts, room, source, buffer, source_id,
 // session_id, prompt_id, kind, key, value, unit, data) with
@@ -102,7 +105,12 @@ pub(crate) fn open_recorder(path: &str) -> DbResult<Connection> {
         )
         .map_err(|e| -> Box<dyn std::error::Error> {
             let cant_open = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen);
-            if cant_open || std::path::Path::new(&format!("{path}-wal")).exists() {
+            // An empty `-wal` left beside a DELETE-mode file says nothing
+            // about its mode; only a non-empty one earns the hint.
+            let wal_has_frames = std::fs::metadata(format!("{path}-wal"))
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            if cant_open || wal_has_frames {
                 format!("{e} (a recorder left in WAL mode cannot be read through the dotfile VFS; run PRAGMA journal_mode=DELETE on it)").into()
             } else {
                 e.into()
@@ -387,23 +395,29 @@ pub(crate) fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec
         "always_on_chars",
         "always_on_files",
     ];
-    let rows = stmt.query_map(rusqlite::params![after_id, FLUSH_BATCH], |r| {
-        let id: i64 = r.get(0)?;
-        // A hand-edited value of the wrong type names its row, so the flush
-        // that it stops can be fixed rather than puzzled over.
-        fn col<T: rusqlite::types::FromSql>(
-            r: &rusqlite::Row<'_>,
-            idx: usize,
-            id: i64,
-        ) -> rusqlite::Result<T> {
-            r.get::<_, T>(idx).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    idx,
-                    rusqlite::types::Type::Null,
-                    format!("row {id}: {}: {e}", NAMES[idx]).into(),
-                )
+    // A hand-edited value of the wrong type names its row, its column and
+    // the type it holds, so the flush that it stops can be fixed rather
+    // than puzzled over.
+    fn col<T: rusqlite::types::FromSql>(r: &rusqlite::Row<'_>, idx: usize, id: i64) -> DbResult<T> {
+        r.get::<_, T>(idx)
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                let name = NAMES[idx];
+                match e {
+                    rusqlite::Error::InvalidColumnType(_, _, found) => {
+                        format!("row {id}: {name}: holds a {found} value, which is the wrong type")
+                    }
+                    rusqlite::Error::IntegralValueOutOfRange(_, v) => {
+                        format!("row {id}: {name}: value {v} is out of range")
+                    }
+                    other => format!("row {id}: {name}: {other}"),
+                }
+                .into()
             })
-        }
+    }
+    let mut rows = stmt.query(rusqlite::params![after_id, FLUSH_BATCH])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let id: i64 = r.get(0)?;
         let files_text: Option<String> = col(r, 18, id)?;
         let files = files_text
             .as_deref()
@@ -425,7 +439,7 @@ pub(crate) fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec
             "rate_7d_resets": col::<Option<i64>>(r, 16, id)?,
             "always_on_chars": col::<Option<i64>>(r, 17, id)?,
         });
-        Ok(LocalRow {
+        out.push(LocalRow {
             id,
             ts: col(r, 1, id)?,
             session_id: col(r, 5, id)?,
@@ -434,11 +448,7 @@ pub(crate) fn read_local_rows(local: &Connection, after_id: i64) -> DbResult<Vec
             always_on_chars: col(r, 17, id)?,
             data,
             files,
-        })
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
+        });
     }
     Ok(out)
 }
@@ -588,3 +598,7 @@ pub(crate) fn run_flush(
     }
     Ok(report)
 }
+
+#[cfg(test)]
+#[path = "flush_tests.rs"]
+mod tests;
