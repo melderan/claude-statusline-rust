@@ -51,6 +51,12 @@ cargo build --release
 
 The binary is `target/release/claude-statusline-rust`. The crate uses the 2024 edition and let chains, so it needs Rust 1.88 or newer. SQLite is compiled in, so you also need a C compiler.
 
+To see any build render before wiring it into Claude Code, `scripts/dev-payload` prints a payload in the shape Claude Code sends, with neutral names:
+
+```
+scripts/dev-payload | target/release/claude-statusline-rust
+```
+
 ## Configure Claude Code
 
 Add this to `~/.claude/settings.json`, with the real path:

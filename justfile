@@ -25,9 +25,9 @@ build: preflight
 release: preflight
     cargo build --release
 
-# Build debug and run with sample JSON (dev loop)
+# Build debug and run with a sample payload (dev loop)
 dev:
-    echo '{"model":{"id":"claude-opus-4-6","display_name":"Claude Opus 4.6"},"workspace":{"project_dir":"/Users/dev/projects/myapp","git_worktree":"fix-auth-bug"},"context_window":{"total_input_tokens":154200,"total_output_tokens":42100,"context_window_size":1000000,"used_percentage":19.6},"cost":{"total_cost_usd":1.87},"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":'"$(date -v+2H -v+13M +%s)"'},"seven_day":{"used_percentage":41.2,"resets_at":'"$(date -v+5d +%s)"'}},"subagents":{"count":3}}' | cargo run
+    scripts/dev-payload | cargo run --quiet
 
 # Quick build and install (skip tests)
 install: release

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Print a hook payload in the shape Claude Code sends, with neutral names and
+# rate-limit windows that reset in the future, so the output is what a live
+# session would show. Try an install: scripts/dev-payload | claude-statusline-rust
+set -euo pipefail
+
+now="$(date +%s)"
+five_hour=$((now + 2 * 3600 + 13 * 60))
+seven_day=$((now + 5 * 86400))
+cat <<JSON
+{
+  "version": "2.1.292",
+  "session_id": "00000000-0000-4000-8000-000000000000",
+  "cwd": "/home/dev/code/my-app",
+  "model": { "id": "claude-fable-5-1", "display_name": "Fable 5.1" },
+  "workspace": {
+    "current_dir": "/home/dev/code/my-app/src",
+    "project_dir": "/home/dev/code/my-app",
+    "repo": { "host": "github.com", "owner": "example", "name": "my-app" }
+  },
+  "context_window": {
+    "total_input_tokens": 117705,
+    "total_output_tokens": 4,
+    "context_window_size": 1000000,
+    "used_percentage": 14.0,
+    "remaining_percentage": 86.0,
+    "current_usage": {
+      "input_tokens": 1200,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 9000,
+      "cache_read_input_tokens": 107505
+    }
+  },
+  "cost": {
+    "total_cost_usd": 1.87,
+    "total_duration_ms": 4320000,
+    "total_api_duration_ms": 610000,
+    "total_lines_added": 120,
+    "total_lines_removed": 18
+  },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 42.0, "resets_at": $five_hour },
+    "seven_day": { "used_percentage": 18.0, "resets_at": $seven_day }
+  },
+  "effort": { "level": "high" },
+  "thinking": { "enabled": true },
+  "session_name": "refactor auth"
+}
+JSON
