@@ -4,6 +4,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-09
+
 ### Added
 
 - `db:locked` marker on the misc line when a render skips its metrics row because the database is busy or locked, for both the default local file and a shared `metrics_db`. It is kept in one-line mode until the ctx tail would have to go.

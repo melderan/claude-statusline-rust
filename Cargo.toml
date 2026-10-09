@@ -1,6 +1,6 @@
 [package]
 name = "claude-statusline-rust"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "A fast status line for Claude Code: context use, prompt cache, git state and rate-limit pace, with no network access"
 license = "Apache-2.0"
