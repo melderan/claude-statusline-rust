@@ -33,12 +33,12 @@ fn run(
     let mut child = cmd.spawn().unwrap();
     {
         use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
+        // A program that answers without reading stdin (--version, --help)
+        // may exit before this write lands, and a release build usually
+        // does; the closed pipe is then the expected outcome, not a failure.
+        if let Err(e) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+        }
     }
     let out = child.wait_with_output().unwrap();
     (
