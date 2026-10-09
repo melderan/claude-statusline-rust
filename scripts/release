@@ -29,6 +29,18 @@ actions=0
 say() { printf 'release: %s\n' "$*"; }
 act() { actions=$((actions + 1)); printf 'release: %s\n' "$*"; }
 fail() { printf 'release: %s\n' "$*" >&2; exit 1; }
+# File mode as octal digits, GNU stat first, then BSD.
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+# The files this script rewrites must come out with the modes they went in with:
+# a temp file is created 600, and a release once left two tracked files that way.
+declare -A mode_before
+remember_modes() { for f in "$@"; do mode_before["$f"]="$(mode_of "$f")"; done; }
+check_modes() {
+  for f in "${!mode_before[@]}"; do
+    after="$(mode_of "$f")"
+    [ "$after" = "${mode_before[$f]}" ] || fail "$f changed mode ${mode_before[$f]} -> $after; fix the mode and the script before tagging"
+  done
+}
 
 semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
 [[ "$version" =~ $semver ]] || fail "$version is not X.Y.Z or X.Y.Z-rc.N (no leading zeros, no other suffix)"
@@ -91,6 +103,7 @@ entries="$(awk '/^## \[Unreleased\]/ { on = 1; next } /^## \[/ { on = 0 } on && 
 [ "$entries" -gt 0 ] || fail "[Unreleased] has no entries; nothing to release"
 grep -q "^## \[$version\]" CHANGELOG.md && fail "CHANGELOG.md already has a [$version] heading"
 today="$(date -u +%Y-%m-%d)"
+remember_modes CHANGELOG.md Cargo.toml Cargo.lock
 tmp="$(mktemp)"
 awk -v v="$version" -v d="$today" '
   /^## \[Unreleased\]/ { print; print ""; print "## [" v "] - " d; next }
@@ -111,6 +124,8 @@ cat "$tmp" >Cargo.toml && rm -f "$tmp"
 act "Cargo.toml: version = \"$version\""
 cargo update --workspace --quiet
 act "Cargo.lock: updated for the new version"
+check_modes
+say "file modes unchanged"
 
 # ── Tests on the exact tree that ships ──
 say "cargo test --release --locked"
