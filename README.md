@@ -41,6 +41,12 @@ cargo install --git https://github.com/melderan/claude-statusline-rust
 
 This puts the binary in `~/.cargo/bin`.
 
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) installed, this fetches the release archive for your machine instead of compiling:
+
+```
+cargo binstall claude-statusline-rust --git https://github.com/melderan/claude-statusline-rust
+```
+
 ### From source
 
 ```
