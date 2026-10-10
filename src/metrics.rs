@@ -236,7 +236,7 @@ pub(crate) fn ensure_schema_inner(conn: &Connection) -> DbResult<()> {
 /// One metrics row, as a render produces it and as the spill keeps it.
 /// `ts` is None for a row written as it happens (SQLite stamps it); a spilled
 /// row carries the time of the render that produced it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, Deserialize)]
 pub(crate) struct MetricsRow {
     pub(crate) ts: Option<String>,
     pub(crate) project: Option<String>,
@@ -456,249 +456,192 @@ pub(crate) fn residue_deltas(conn: &Connection, session_id: &str, n: usize) -> D
 // ─────────────────────────────────────────────────────────────────────
 //
 // A render on a shared file (`metrics_db`) waits RENDER_PATIENCE for its
-// lock. When that runs out the row goes to the `metrics_spill` table of the
-// default local file under HOME instead of being dropped. That file is
-// already there for the default setup, is on local disk, uses WAL, and is
-// only ever opened by this machine, so writing to it does not meet the lock
-// that just timed out; a table in it needs no new file format.
+// lock. When that runs out the row is kept in a file of its own under
+// `<local metrics dir>/spill/<hash of the shared path>/`, named
+// `<microseconds>-<session>-<spill key>.json`: one JSON object with the
+// row's columns, its timestamp and a random `spill_key`. The file is
+// written under a dot-name and renamed into place, so it appears whole or
+// not at all. Keeping a row takes no lock of any kind: nothing in this
+// step can be busy.
 //
-// The next render that gets the shared lock drains the spill: in one
-// transaction it copies the oldest spilled rows for that shared file, then
-// writes its own row, and commits. Only after the commit does it delete
-// the copied rows from the spill. A crash between the commit and the delete
-// leaves rows that are in both files; each spilled row carries a random
-// `spill_key` that the shared file keeps under a unique index, so draining
-// them again inserts nothing. Deleting first would lose them instead.
+// One file per row, not one append-only file per session: a drain that
+// read a session's file and then deleted or rewrote it would lose a row
+// appended between the read and the delete, and closing that window would
+// need a lock again. A row file is never written after it appears.
 //
-// The spill holds every session's rows and any render drains them, oldest
-// first, so a session that ends right after a skipped render still has its
-// row delivered by the next render on the machine. A session's own rows
-// keep their order: its next render drains them before writing its own row.
+// The next render that gets the shared lock drains, inside the same
+// BEGIN IMMEDIATE as its own row: it reads the oldest row files (names
+// sort by time), inserts them, inserts its own row and commits. Only after
+// the commit does it delete the files it wrote. A crash between the commit
+// and the delete leaves rows that are in both places; the shared file keeps
+// `spill_key` under a unique index, so draining them again inserts nothing.
+// Drains are serialised by the shared lock itself.
+//
+// Any render drains every session's rows, oldest first, so a session that
+// ended right after a skipped render still has its row delivered. A
+// session's own rows keep their order: its next render drains them before
+// writing its own row.
+//
+// A row file that does not parse, or that the shared file refuses for a
+// reason other than a lock, is moved to `failed/` beside it with the error,
+// named once on stderr, and never retried or deleted.
 
-/// Spilled rows one render copies at most.
-pub(crate) const DRAIN_BATCH: i64 = 100;
+/// Kept rows one render reads at most.
+pub(crate) const DRAIN_BATCH: usize = 100;
 
-/// How long a render keeps copying spilled rows once it holds the shared
+/// How long a render keeps copying kept rows once it holds the shared
 /// lock. Other renders wait RENDER_PATIENCE for that lock, so a drain that
-/// held it for longer would make them spill in turn; well under half of it
-/// leaves room for the render's own row and the commit. At least one row is
-/// copied whatever the clock says, so a backlog always shrinks.
+/// held it for longer would make them give up in turn; well under half of
+/// it leaves room for the render's own row and the commit. At least one row
+/// is copied whatever the clock says, so a backlog always shrinks.
 pub(crate) const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// The default local metrics file, where the spill lives.
+/// The default local metrics file.
 pub(crate) fn local_metrics_path(home: &str) -> String {
     format!("{home}/.config/dbg/statusline-metrics.db")
 }
 
-pub(crate) fn open_local_metrics(home: &str) -> DbResult<Connection> {
-    let path = local_metrics_path(home);
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let conn = open_metrics_at(&path, false, RENDER_PATIENCE)?;
-    // The last connection to close a WAL file checkpoints it, holding the
-    // file exclusively through an fsync. On a busy disk that fsync outlasts
-    // RENDER_PATIENCE, and the renders spilling at the same moment, all of
-    // which just gave up on the shared file, failed to keep their rows. The
-    // spill's connections skip that checkpoint; SQLite's automatic one, which
-    // runs after a commit without blocking readers or writers, still keeps
-    // the WAL to about a thousand pages.
-    conn.set_db_config(
-        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-        true,
-    )?;
-    Ok(conn)
+/// FNV-1a, 64 bits: a short, stable name for a shared path.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
-pub(crate) fn ensure_spill(local: &Connection) -> DbResult<()> {
-    local.execute_batch(
-        "CREATE TABLE IF NOT EXISTS metrics_spill (
-            spill_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            target          TEXT NOT NULL, -- the shared file the row is for
-            spill_key       TEXT NOT NULL UNIQUE,
-            ts              TEXT NOT NULL,
-            project         TEXT,
-            branch          TEXT,
-            model           TEXT,
-            session_id      TEXT,
-            prompt_id       TEXT,
-            content         INTEGER,
-            in_tokens       INTEGER NOT NULL,
-            out_tokens      INTEGER NOT NULL,
-            context_cap     INTEGER NOT NULL,
-            context_pct     REAL NOT NULL,
-            cost_usd        REAL,
-            rate_5h_pct     REAL,
-            rate_5h_resets  INTEGER,
-            rate_7d_pct     REAL,
-            rate_7d_resets  INTEGER,
-            always_on_chars INTEGER,
-            always_on_files TEXT,
-            failed          TEXT -- why the shared file refused the row; never drained again
-        );
-        CREATE INDEX IF NOT EXISTS metrics_spill_target ON metrics_spill(target, spill_id);",
-    )?;
-    Ok(())
+/// Where rows kept for `target` wait.
+pub(crate) fn spill_dir(home: &str, target: &str) -> std::path::PathBuf {
+    std::path::Path::new(home)
+        .join(".config/dbg/spill")
+        .join(format!("{:016x}", fnv1a(target)))
 }
 
-/// Keep `row` for `target`, stamped now. A row that repeats this session's
-/// last spilled row is dropped, as the shared file would drop it.
-pub(crate) fn spill_row(local: &Connection, target: &str, row: &MetricsRow) -> DbResult<()> {
-    ensure_spill(local)?;
-    let last: Option<RowNumbers> = local
-        .query_row(
-            &format!(
-                "{NUMBERS_SELECT} FROM metrics_spill WHERE target = ?1 AND session_id IS ?2 ORDER BY spill_id DESC LIMIT 1"
-            ),
-            rusqlite::params![target, row.session_id],
-            read_numbers,
-        )
-        .ok();
-    if last.is_some_and(|l| same_numbers(l, row.numbers())) {
-        return Ok(());
-    }
-    local.execute(
-        "INSERT INTO metrics_spill (target, spill_key, ts, project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files)
-         VALUES (?1, ?2, COALESCE(?3, strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-        rusqlite::params![
-            target,
-            mint_id(),
-            row.ts,
-            row.project,
-            row.branch,
-            row.model,
-            row.session_id,
-            row.prompt_id,
-            row.content,
-            row.in_tokens,
-            row.out_tokens,
-            row.context_cap,
-            row.context_pct,
-            row.cost_usd,
-            row.rate_5h_pct,
-            row.rate_5h_resets,
-            row.rate_7d_pct,
-            row.rate_7d_resets,
-            row.always_on_chars,
-            row.always_on_files,
-        ],
-    )?;
-    Ok(())
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` for a time since the epoch, the format the
+/// shared file stamps its own rows with.
+pub(crate) fn utc_stamp(since_epoch: std::time::Duration) -> String {
+    let secs = since_epoch.as_secs() as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days to a civil date (proleptic Gregorian), after H. Hinnant.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60,
+        since_epoch.subsec_millis()
+    )
 }
 
-/// A row waiting in the spill.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Spilled {
-    pub(crate) spill_id: i64,
+/// One kept row as its file holds it.
+#[derive(serde::Serialize, Deserialize, Debug, PartialEq)]
+pub(crate) struct KeptRow {
     pub(crate) spill_key: String,
+    #[serde(flatten)]
     pub(crate) row: MetricsRow,
 }
 
-/// The oldest `limit` spilled rows for `target` not set aside as refused;
-/// none when there is no spill.
-pub(crate) fn read_spill(local: &Connection, target: &str, limit: i64) -> DbResult<Vec<Spilled>> {
-    let has: i64 = local.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics_spill'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has == 0 {
-        return Ok(Vec::new());
+/// A session id as part of a file name: letters, digits, `-` and `_` kept,
+/// anything else `_`, at most 64 characters; `_none` without one. The
+/// file's content carries the real id.
+fn name_part(session: Option<&str>) -> String {
+    match session {
+        None => "_none".into(),
+        Some(s) => s
+            .chars()
+            .take(64)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
     }
-    let mut stmt = local.prepare(
-        "SELECT spill_id, spill_key, ts, project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files
-         FROM metrics_spill WHERE target = ?1 AND failed IS NULL ORDER BY spill_id LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![target, limit], |r| {
-        Ok(Spilled {
-            spill_id: r.get(0)?,
-            spill_key: r.get(1)?,
-            row: MetricsRow {
-                ts: r.get(2)?,
-                project: r.get(3)?,
-                branch: r.get(4)?,
-                model: r.get(5)?,
-                session_id: r.get(6)?,
-                prompt_id: r.get(7)?,
-                content: r.get(8)?,
-                in_tokens: r.get(9)?,
-                out_tokens: r.get(10)?,
-                context_cap: r.get(11)?,
-                context_pct: r.get(12)?,
-                cost_usd: r.get(13)?,
-                rate_5h_pct: r.get(14)?,
-                rate_5h_resets: r.get(15)?,
-                rate_7d_pct: r.get(16)?,
-                rate_7d_resets: r.get(17)?,
-                always_on_chars: r.get(18)?,
-                always_on_files: r.get(19)?,
-            },
-        })
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
 }
 
-/// Remove rows the shared file now holds.
-pub(crate) fn delete_spilled(local: &Connection, done: &[Spilled]) -> DbResult<()> {
-    local.execute_batch("BEGIN IMMEDIATE;")?;
-    let inner = || -> DbResult<()> {
-        let mut del = local.prepare("DELETE FROM metrics_spill WHERE spill_id = ?1")?;
-        for s in done {
-            del.execute([s.spill_id])?;
-        }
-        Ok(())
+/// Keep `row` for `target`, stamped now. Returns the file it is in.
+pub(crate) fn keep_row(
+    home: &str,
+    target: &str,
+    row: &MetricsRow,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let dir = spill_dir(home, target);
+    std::fs::create_dir_all(&dir)?;
+    // Which shared file the directory is for, for whoever looks at it.
+    let named = dir.join("target.txt");
+    if !named.exists() {
+        let _ = std::fs::write(&named, format!("{target}\n"));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let key = mint_id();
+    let mut kept = KeptRow {
+        spill_key: key.clone(),
+        row: row.clone(),
     };
-    match inner().and_then(|()| Ok(local.execute_batch("COMMIT;")?)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = local.execute_batch("ROLLBACK;");
-            Err(e)
-        }
-    }
+    kept.row.ts.get_or_insert_with(|| utc_stamp(now));
+    let body = serde_json::to_vec(&kept).map_err(std::io::Error::other)?;
+    let tmp = dir.join(format!(".{key}.tmp"));
+    let path = dir.join(format!(
+        "{:020}-{}-{key}.json",
+        now.as_micros(),
+        name_part(row.session_id.as_deref())
+    ));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&body)?;
+    drop(f);
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
 }
 
-/// Spill `row` for `target`, retrying a busy local file within
-/// RENDER_PATIENCE. Several renders that all just timed out on the shared
-/// file spill at once, and a WAL file can answer BUSY without waiting (a
-/// connection opening it while another one closes it, say), so the busy
-/// timeout alone does not cover every case.
-pub(crate) fn keep_locally(home: &str, target: &str, row: &MetricsRow) -> DbResult<()> {
-    let deadline = std::time::Instant::now() + RENDER_PATIENCE;
-    loop {
-        match open_local_metrics(home).and_then(|l| spill_row(&l, target, row)) {
-            Err(e) if is_busy(e.as_ref()) && std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            r => return r,
-        }
-    }
+/// The oldest `limit` row files in `dir`, oldest first; none when there is
+/// no directory.
+pub(crate) fn pending(dir: &std::path::Path, limit: usize) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.') && n.ends_with(".json"))
+        .collect();
+    names.sort();
+    names.truncate(limit);
+    names.into_iter().map(|n| dir.join(n)).collect()
 }
 
-/// What a drain did with the spilled rows it was handed, by index.
+/// What a drain did with the kept rows.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Drained {
-    /// Rows the shared file now holds (written, already there, or dropped
-    /// as a repeat): delete them from the spill.
-    pub(crate) written: Vec<usize>,
-    /// Rows the shared file refused for a reason other than a lock, with
-    /// the error: mark them in the spill so no later drain retries them.
-    pub(crate) refused: Vec<(usize, String)>,
+    /// Files whose row the shared file now holds (written, already there,
+    /// or dropped as a repeat): delete them.
+    pub(crate) written: Vec<std::path::PathBuf>,
+    /// Files that did not parse or whose row the shared file refused for a
+    /// reason other than a lock, with the error: set them aside.
+    pub(crate) refused: Vec<(std::path::PathBuf, String)>,
 }
 
-/// In one transaction on the shared file: the spilled rows in order, as many
-/// as `budget` allows (at least one), then `own`. Each spilled row has its
-/// own savepoint, so a row the shared file refuses for any reason other than
-/// a lock is undone alone, reported in `refused`, and the drain goes on with
-/// the next one: one bad row never stops the rows behind it, nor costs a
-/// render its own row. A lock (not expected while the transaction holds the
-/// file) ends the drain with the row left for later.
+/// In one transaction on the shared file: the kept rows in `dir`, oldest
+/// first, as many as DRAIN_BATCH and `budget` allow (at least one), then
+/// `own`. Each kept row has its own savepoint, so a refused one is undone
+/// alone and the drain goes on with the next: one bad row never stops the
+/// rows behind it, nor costs a render its own row. A lock (not expected
+/// while the transaction holds the file) ends the drain with the row left
+/// for later. Nothing is deleted here.
 pub(crate) fn write_with_drain(
     shared: &Connection,
-    spilled: &[Spilled],
+    dir: Option<&std::path::Path>,
     own: &MetricsRow,
     budget: std::time::Duration,
 ) -> DbResult<Drained> {
@@ -706,23 +649,35 @@ pub(crate) fn write_with_drain(
     let start = std::time::Instant::now();
     let inner = || -> DbResult<Drained> {
         let mut out = Drained::default();
-        for (i, s) in spilled.iter().enumerate() {
+        let files = dir.map(|d| pending(d, DRAIN_BATCH)).unwrap_or_default();
+        for (i, path) in files.into_iter().enumerate() {
             if i > 0 && start.elapsed() >= budget {
                 break;
             }
-            shared.execute_batch("SAVEPOINT spilled_row;")?;
-            match log_row(shared, &s.row, Some(&s.spill_key)) {
-                Ok(()) => out.written.push(i),
+            // A file that cannot be read now (removed by hand, say) is left.
+            let Ok(text) = std::fs::read(&path) else {
+                continue;
+            };
+            let kept: KeptRow = match serde_json::from_slice(&text) {
+                Ok(k) => k,
                 Err(e) => {
-                    shared.execute_batch("ROLLBACK TO spilled_row;")?;
+                    out.refused.push((path, format!("does not parse: {e}")));
+                    continue;
+                }
+            };
+            shared.execute_batch("SAVEPOINT kept_row;")?;
+            match log_row(shared, &kept.row, Some(&kept.spill_key)) {
+                Ok(()) => out.written.push(path),
+                Err(e) => {
+                    shared.execute_batch("ROLLBACK TO kept_row;")?;
                     if is_busy(e.as_ref()) {
-                        shared.execute_batch("RELEASE spilled_row;")?;
+                        shared.execute_batch("RELEASE kept_row;")?;
                         break;
                     }
-                    out.refused.push((i, e.to_string()));
+                    out.refused.push((path, e.to_string()));
                 }
             }
-            shared.execute_batch("RELEASE spilled_row;")?;
+            shared.execute_batch("RELEASE kept_row;")?;
         }
         log_row(shared, own, None)?;
         shared.execute_batch("COMMIT;")?;
@@ -737,55 +692,57 @@ pub(crate) fn write_with_drain(
     }
 }
 
-/// Mark a spilled row the shared file refused: later drains skip it, and it
-/// stays in the spill, with the error, for whoever repairs it.
-pub(crate) fn mark_refused(local: &Connection, spill_id: i64, error: &str) -> DbResult<()> {
-    local.execute(
-        "UPDATE metrics_spill SET failed = ?2 WHERE spill_id = ?1",
-        rusqlite::params![spill_id, error],
-    )?;
-    Ok(())
+/// Move a refused row file to `failed/` beside it, wrapped with the error:
+/// never retried, never deleted. The copy is written before the original
+/// goes, so a crash in between leaves the row in both places, not neither.
+pub(crate) fn set_aside(
+    path: &std::path::Path,
+    error: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("failed");
+    std::fs::create_dir_all(&dir)?;
+    let name = path.file_name().unwrap_or_default();
+    let raw = std::fs::read(path)?;
+    let body = serde_json::json!({
+        "error": error,
+        "kept": String::from_utf8_lossy(&raw),
+    });
+    let dest = dir.join(name);
+    let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    std::fs::write(&tmp, body.to_string())?;
+    std::fs::rename(&tmp, &dest)?;
+    std::fs::remove_file(path)?;
+    Ok(dest)
 }
 
 /// Write this render's row to `shared` (a `metrics_db` file), draining the
-/// spill for it first. Rows are deleted from the spill only after the
-/// shared file has committed them.
+/// rows kept for it first. Kept files are deleted only after the shared
+/// file has committed their rows.
 pub(crate) fn write_shared(
     shared: &Connection,
     home: &str,
     target: &str,
     own: &MetricsRow,
 ) -> DbResult<()> {
-    // No local file yet means nothing was ever spilled: skip opening it.
-    let local = if std::path::Path::new(&local_metrics_path(home)).exists() {
-        open_local_metrics(home).ok()
-    } else {
-        None
-    };
-    let spilled = local
-        .as_ref()
-        .and_then(|l| read_spill(l, target, DRAIN_BATCH).ok())
-        .unwrap_or_default();
-    let drained = write_with_drain(shared, &spilled, own, DRAIN_BUDGET)?;
-    if let Some(l) = &local {
-        let done: Vec<Spilled> = drained
-            .written
-            .iter()
-            .map(|&i| spilled[i].clone())
-            .collect();
-        if !done.is_empty() {
-            // A failure here leaves rows the next drain finds already written.
-            let _ = delete_spilled(l, &done);
-        }
-        for (i, error) in &drained.refused {
-            let id = spilled[*i].spill_id;
-            // Said once per row: a marked row is never drained again. If the
-            // mark fails the next drain meets the row and says it again.
-            if mark_refused(l, id, error).is_ok() {
-                eprintln!(
-                    "claude-statusline-rust: kept metrics row {id} refused by the shared file and set aside: {error}"
-                );
-            }
+    let dir = spill_dir(home, target);
+    // No directory means nothing was ever kept: one stat, no listing.
+    let dir = dir.is_dir().then_some(dir);
+    let drained = write_with_drain(shared, dir.as_deref(), own, DRAIN_BUDGET)?;
+    for path in &drained.written {
+        // A failure here leaves a row the next drain finds already written.
+        let _ = std::fs::remove_file(path);
+    }
+    for (path, error) in &drained.refused {
+        // Said once per row: a row set aside is never drained again. If
+        // moving it fails the next drain meets it and says it again.
+        if let Ok(dest) = set_aside(path, error) {
+            eprintln!(
+                "claude-statusline-rust: kept metrics row set aside in {}: {error}",
+                dest.display()
+            );
         }
     }
     Ok(())
@@ -795,8 +752,8 @@ pub(crate) fn write_shared(
 /// residue line, and whether the database was busy or locked.
 ///
 /// On the default local file a busy file skips the row, as it always did.
-/// On a shared file a busy file at open or at insert sends the row to the
-/// spill; the render still shows `db:locked` and prints one stderr line,
+/// On a shared file a busy file at open or at insert keeps the row in a
+/// file of its own under the local metrics directory; the render still shows `db:locked` and prints one stderr line,
 /// because a lock that stays stuck must stay visible.
 pub(crate) fn record_render(
     cfg: &Config,
@@ -811,8 +768,8 @@ pub(crate) fn record_render(
     let report = |e: &(dyn std::error::Error + 'static), what: &str| -> bool {
         let busy = is_busy(e);
         match &target {
-            Some(t) if busy => match keep_locally(home, t, row) {
-                Ok(()) => eprintln!(
+            Some(t) if busy => match keep_row(home, t, row) {
+                Ok(_) => eprintln!(
                     "claude-statusline-rust: metrics row kept locally until the shared file is free: {e}"
                 ),
                 Err(e2) => eprintln!(

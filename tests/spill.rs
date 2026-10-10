@@ -1,6 +1,6 @@
 //! A shared metrics file that is busy loses no rows: a render that cannot
-//! get the lock keeps its row in the local file, and a later render writes
-//! it. Drives the built binary.
+//! get the lock keeps its row in a file under the local metrics directory,
+//! and a later render writes it. Drives the built binary.
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -71,16 +71,20 @@ fn rows(db: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Rows still waiting in the local spill, not set aside as refused.
-fn spill_left(home: &std::path::Path) -> i64 {
-    let local = home.join(".config/dbg/statusline-metrics.db");
-    let conn = rusqlite::Connection::open(local).unwrap();
-    conn.query_row(
-        "SELECT COUNT(*) FROM metrics_spill WHERE failed IS NULL",
-        [],
-        |r| r.get(0),
-    )
-    .unwrap_or(0)
+/// Kept rows still waiting under `home`, for any shared file.
+fn spill_left(home: &std::path::Path) -> usize {
+    let Ok(dirs) = std::fs::read_dir(home.join(".config/dbg/spill")) else {
+        return 0;
+    };
+    dirs.filter_map(|d| d.ok())
+        .filter_map(|d| std::fs::read_dir(d.path()).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            !n.starts_with('.') && n.ends_with(".json")
+        })
+        .count()
 }
 
 #[test]

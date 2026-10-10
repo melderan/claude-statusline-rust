@@ -7,9 +7,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Added
 
 - `cargo binstall` metadata in `Cargo.toml`, so `cargo binstall claude-statusline-rust --git <repo>` fetches the release archive for the host instead of compiling.
+
 ### Fixed
 
-- A render that cannot lock a shared metrics file (`CSR_METRICS_DB`) within 50 ms no longer loses its row. The row is kept in a `metrics_spill` table of the default local file, and the next render that gets the lock writes the kept rows first, oldest first with their original timestamps, for at most 20 ms or 100 rows, then its own row. The render that kept its row back still shows `db:locked` and prints one line to stderr. The shared file gains a `spill_key` column with a unique index, so a row that is written again after a crash does not appear twice. A kept row the shared file refuses for a reason other than a lock is set aside in the local file with its error in a `failed` column, named once on stderr, and never retried or deleted; the rows behind it still drain.
+- A render that cannot lock a shared metrics file (`CSR_METRICS_DB`) within 50 ms no longer loses its row. The row is kept in a file of its own, named by time and session, under the local metrics directory (`~/.config/dbg/spill/`), written without taking any lock, and the next render that gets the lock writes the kept rows first, oldest first with their original timestamps, for at most 20 ms or 100 rows, then its own row. The render that kept its row back still shows `db:locked` and prints one line to stderr. The shared file gains a `spill_key` column with a unique index, so a row that is written again after a crash does not appear twice. A kept row the shared file refuses for a reason other than a lock is moved with its error to a `failed/` directory beside it, named once on stderr, and never retried or deleted; the rows behind it still drain.
 - The first renders of a brand-new shared metrics file no longer lose rows on a slow machine when some of them start after the file has its header and so get only 50 ms: their rows are kept and written by a later render.
 
 ### Changed
