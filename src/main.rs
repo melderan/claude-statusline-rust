@@ -99,49 +99,38 @@ fn main() {
         .workspace
         .as_ref()
         .and_then(|w| w.git_worktree.as_deref());
-    let opened = open_metrics_db(&cfg, &home);
-    // A busy or locked file, at open or at insert, skips the row; the status
-    // line says so (`db:locked`) because the stderr line is rarely read.
-    let mut db_locked = false;
-    if let Err(e) = &opened {
-        db_locked |= is_busy(e.as_ref());
-        if cfg.metrics_db.is_some() {
-            // The shared file is locked or unreachable: this row is skipped,
-            // never forced. One line, so a hook or a log shows it.
-            eprintln!("claude-statusline-rust: metrics skipped: {e}");
-        }
-    }
-    let residue: Vec<i64> = opened
-        .ok()
-        .map(|conn| {
-            let logged = log_metrics(
-                &conn,
-                project_dir,
-                branch,
-                data.model.as_ref().and_then(|m| m.display_name.as_deref()),
-                data.session_id.as_deref(),
-                data.prompt_id.as_deref(),
-                content,
-                in_tok,
-                out_tok,
-                cap,
-                raw_pct,
-                data.cost.as_ref().and_then(|c| c.total_cost_usd),
-                data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
-                data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
-                Some(&on),
-            );
-            if let Err(e) = &logged {
-                db_locked |= is_busy(e.as_ref());
-                if cfg.metrics_db.is_some() {
-                    eprintln!("claude-statusline-rust: metrics row skipped: {e}");
-                }
-            }
-            match (residue_turns(&cfg.residue), data.session_id.as_deref()) {
+    let row = metrics_row(
+        project_dir,
+        branch,
+        data.model.as_ref().and_then(|m| m.display_name.as_deref()),
+        data.session_id.as_deref(),
+        data.prompt_id.as_deref(),
+        content,
+        in_tok,
+        out_tok,
+        cap,
+        raw_pct,
+        data.cost.as_ref().and_then(|c| c.total_cost_usd),
+        data.rate_limits.as_ref().and_then(|r| r.five_hour.as_ref()),
+        data.rate_limits.as_ref().and_then(|r| r.seven_day.as_ref()),
+        Some(&on),
+    );
+    // A busy or locked file, at open or at insert, shows `db:locked` because
+    // the stderr line is rarely read. On a shared file the row is kept
+    // locally and written by a later render; on the local file it is skipped.
+    let (conn, db_locked) = record_render(&cfg, &home, &row);
+    // The residue line reads the metrics file only, not rows still waiting
+    // locally: those reach the shared file, ahead of the next render's own
+    // row, at the first render that gets the lock, and a render that kept
+    // its row back already shows `db:locked`. Merging the two would cost a
+    // second query on every render for a gap that closes by itself.
+    let residue: Vec<i64> = conn
+        .map(
+            |conn| match (residue_turns(&cfg.residue), data.session_id.as_deref()) {
                 (n, Some(sid)) if n > 0 => residue_deltas(&conn, sid, n).unwrap_or_default(),
                 _ => Vec::new(),
-            }
-        })
+            },
+        )
         .unwrap_or_default();
 
     let git = if !current_dir.is_empty() {
