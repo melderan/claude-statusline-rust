@@ -123,8 +123,8 @@ fn a_crash_between_the_shared_commit_and_the_spill_delete_writes_no_duplicate() 
     // Step one of the drain commits to the shared file; the process then
     // dies before step two, the delete from the spill.
     let spilled = read_spill(&local, &target, DRAIN_BATCH).unwrap();
-    let n = write_with_drain(&shared(&home), &spilled, &row("a", "p3", 13), DRAIN_BUDGET).unwrap();
-    assert_eq!(n, 3);
+    let d = write_with_drain(&shared(&home), &spilled, &row("a", "p3", 13), DRAIN_BUDGET).unwrap();
+    assert_eq!(d.written, [0, 1, 2]);
     assert_eq!(spill_count(&home), 3, "the delete never ran");
     assert_eq!(shared_rows(&home).len(), 4);
 
@@ -167,14 +167,14 @@ fn the_drain_stops_at_its_budget_but_always_moves_one_row() {
         spill_row(&local, &target, &row("a", &format!("p{i}"), 10 + i)).unwrap();
     }
     let spilled = read_spill(&local, &target, DRAIN_BATCH).unwrap();
-    let n = write_with_drain(
+    let d = write_with_drain(
         &shared(&home),
         &spilled,
         &row("b", "own", 1),
         std::time::Duration::ZERO,
     )
     .unwrap();
-    assert_eq!(n, 1, "an exhausted budget still copies one row");
+    assert_eq!(d.written, [0], "an exhausted budget still copies one row");
     assert_eq!(prompts(&shared_rows(&home)), ["p0", "own"]);
     // The batch cap bounds what one render reads.
     assert_eq!(read_spill(&local, &target, 2).unwrap().len(), 2);
@@ -182,7 +182,7 @@ fn the_drain_stops_at_its_budget_but_always_moves_one_row() {
 }
 
 #[test]
-fn a_spilled_row_the_shared_file_refuses_never_costs_the_render_its_row() {
+fn a_spilled_row_the_shared_file_refuses_is_set_aside_and_the_rows_behind_it_drain() {
     let (dir, home, cfg) = setup("refused");
     let target = format!("{home}/shared.db");
     // The shared file refuses rows of session "bad" for a reason that is
@@ -196,18 +196,40 @@ fn a_spilled_row_the_shared_file_refuses_never_costs_the_render_its_row() {
     let local = open_local_metrics(&home).unwrap();
     spill_row(&local, &target, &row("a", "p0", 10)).unwrap();
     spill_row(&local, &target, &row("bad", "p0", 10)).unwrap();
+    spill_row(&local, &target, &row("a", "p1", 11)).unwrap();
     let (_, busy) = record_render(&cfg, &home, &row("c", "own", 1));
     assert!(!busy);
     assert_eq!(
         prompts(&shared_rows(&home)),
-        ["own"],
-        "the drain is undone, the row is not"
+        ["p0", "p1", "own"],
+        "the rows on either side of the bad one drain in the same pass"
     );
+    let left: Vec<(String, Option<String>)> = local
+        .prepare("SELECT session_id, failed FROM metrics_spill")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
     assert_eq!(
-        spill_count(&home),
-        2,
-        "nothing deleted that was not written"
+        left.len(),
+        1,
+        "the refused row stays in the spill: {left:?}"
     );
+    assert_eq!(left[0].0, "bad");
+    assert!(
+        left[0].1.as_deref().is_some_and(|f| f.contains("refused")),
+        "marked with the error: {left:?}"
+    );
+    // Set aside: later drains neither retry it nor stall behind it.
+    assert!(read_spill(&local, &target, DRAIN_BATCH).unwrap().is_empty());
+    spill_row(&local, &target, &row("a", "p2", 12)).unwrap();
+    record_render(&cfg, &home, &row("c", "own2", 2));
+    assert_eq!(
+        prompts(&shared_rows(&home)),
+        ["p0", "p1", "own", "p2", "own2"]
+    );
+    assert_eq!(spill_count(&home), 1, "only the refused row is left");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

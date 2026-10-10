@@ -521,7 +521,8 @@ pub(crate) fn ensure_spill(local: &Connection) -> DbResult<()> {
             rate_7d_pct     REAL,
             rate_7d_resets  INTEGER,
             always_on_chars INTEGER,
-            always_on_files TEXT
+            always_on_files TEXT,
+            failed          TEXT -- why the shared file refused the row; never drained again
         );
         CREATE INDEX IF NOT EXISTS metrics_spill_target ON metrics_spill(target, spill_id);",
     )?;
@@ -581,7 +582,8 @@ pub(crate) struct Spilled {
     pub(crate) row: MetricsRow,
 }
 
-/// The oldest `limit` spilled rows for `target`; none when there is no spill.
+/// The oldest `limit` spilled rows for `target` not set aside as refused;
+/// none when there is no spill.
 pub(crate) fn read_spill(local: &Connection, target: &str, limit: i64) -> DbResult<Vec<Spilled>> {
     let has: i64 = local.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics_spill'",
@@ -593,7 +595,7 @@ pub(crate) fn read_spill(local: &Connection, target: &str, limit: i64) -> DbResu
     }
     let mut stmt = local.prepare(
         "SELECT spill_id, spill_key, ts, project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files
-         FROM metrics_spill WHERE target = ?1 ORDER BY spill_id LIMIT ?2",
+         FROM metrics_spill WHERE target = ?1 AND failed IS NULL ORDER BY spill_id LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![target, limit], |r| {
         Ok(Spilled {
@@ -664,47 +666,73 @@ pub(crate) fn keep_locally(home: &str, target: &str, row: &MetricsRow) -> DbResu
     }
 }
 
+/// What a drain did with the spilled rows it was handed, by index.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Drained {
+    /// Rows the shared file now holds (written, already there, or dropped
+    /// as a repeat): delete them from the spill.
+    pub(crate) written: Vec<usize>,
+    /// Rows the shared file refused for a reason other than a lock, with
+    /// the error: mark them in the spill so no later drain retries them.
+    pub(crate) refused: Vec<(usize, String)>,
+}
+
 /// In one transaction on the shared file: the spilled rows in order, as many
-/// as `budget` allows (at least one), then `own`. Returns how many spilled
-/// rows, from the front, the shared file now holds. A spilled row the shared
-/// file refuses for any reason other than a lock undoes the whole drain but
-/// not `own`: a bad row in the spill never costs a render its row.
+/// as `budget` allows (at least one), then `own`. Each spilled row has its
+/// own savepoint, so a row the shared file refuses for any reason other than
+/// a lock is undone alone, reported in `refused`, and the drain goes on with
+/// the next one: one bad row never stops the rows behind it, nor costs a
+/// render its own row. A lock (not expected while the transaction holds the
+/// file) ends the drain with the row left for later.
 pub(crate) fn write_with_drain(
     shared: &Connection,
     spilled: &[Spilled],
     own: &MetricsRow,
     budget: std::time::Duration,
-) -> DbResult<usize> {
+) -> DbResult<Drained> {
     shared.execute_batch("BEGIN IMMEDIATE;")?;
     let start = std::time::Instant::now();
-    let inner = || -> DbResult<usize> {
-        let mut done = 0;
-        if !spilled.is_empty() {
-            shared.execute_batch("SAVEPOINT drain;")?;
-            for s in spilled {
-                if done > 0 && start.elapsed() >= budget {
-                    break;
-                }
-                if log_row(shared, &s.row, Some(&s.spill_key)).is_err() {
-                    shared.execute_batch("ROLLBACK TO drain;")?;
-                    done = 0;
-                    break;
-                }
-                done += 1;
+    let inner = || -> DbResult<Drained> {
+        let mut out = Drained::default();
+        for (i, s) in spilled.iter().enumerate() {
+            if i > 0 && start.elapsed() >= budget {
+                break;
             }
-            shared.execute_batch("RELEASE drain;")?;
+            shared.execute_batch("SAVEPOINT spilled_row;")?;
+            match log_row(shared, &s.row, Some(&s.spill_key)) {
+                Ok(()) => out.written.push(i),
+                Err(e) => {
+                    shared.execute_batch("ROLLBACK TO spilled_row;")?;
+                    if is_busy(e.as_ref()) {
+                        shared.execute_batch("RELEASE spilled_row;")?;
+                        break;
+                    }
+                    out.refused.push((i, e.to_string()));
+                }
+            }
+            shared.execute_batch("RELEASE spilled_row;")?;
         }
         log_row(shared, own, None)?;
         shared.execute_batch("COMMIT;")?;
-        Ok(done)
+        Ok(out)
     };
     match inner() {
-        Ok(n) => Ok(n),
+        Ok(d) => Ok(d),
         Err(e) => {
             let _ = shared.execute_batch("ROLLBACK;");
             Err(e)
         }
     }
+}
+
+/// Mark a spilled row the shared file refused: later drains skip it, and it
+/// stays in the spill, with the error, for whoever repairs it.
+pub(crate) fn mark_refused(local: &Connection, spill_id: i64, error: &str) -> DbResult<()> {
+    local.execute(
+        "UPDATE metrics_spill SET failed = ?2 WHERE spill_id = ?1",
+        rusqlite::params![spill_id, error],
+    )?;
+    Ok(())
 }
 
 /// Write this render's row to `shared` (a `metrics_db` file), draining the
@@ -726,12 +754,27 @@ pub(crate) fn write_shared(
         .as_ref()
         .and_then(|l| read_spill(l, target, DRAIN_BATCH).ok())
         .unwrap_or_default();
-    let n = write_with_drain(shared, &spilled, own, DRAIN_BUDGET)?;
-    if n > 0
-        && let Some(l) = &local
-    {
-        // A failure here leaves rows the next drain finds already written.
-        let _ = delete_spilled(l, &spilled[..n]);
+    let drained = write_with_drain(shared, &spilled, own, DRAIN_BUDGET)?;
+    if let Some(l) = &local {
+        let done: Vec<Spilled> = drained
+            .written
+            .iter()
+            .map(|&i| spilled[i].clone())
+            .collect();
+        if !done.is_empty() {
+            // A failure here leaves rows the next drain finds already written.
+            let _ = delete_spilled(l, &done);
+        }
+        for (i, error) in &drained.refused {
+            let id = spilled[*i].spill_id;
+            // Said once per row: a marked row is never drained again. If the
+            // mark fails the next drain meets the row and says it again.
+            if mark_refused(l, id, error).is_ok() {
+                eprintln!(
+                    "claude-statusline-rust: kept metrics row {id} refused by the shared file and set aside: {error}"
+                );
+            }
+        }
     }
     Ok(())
 }
