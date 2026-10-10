@@ -14,7 +14,7 @@ pub(crate) fn metrics_db_path(cfg: &Config, home: &str) -> DbResult<(String, boo
     }
     Ok(match resolve_metrics_db(cfg.metrics_db.as_deref(), home) {
         Some(path) => (path, true),
-        None => (format!("{home}/.config/dbg/statusline-metrics.db"), false),
+        None => (local_metrics_path(home), false),
     })
 }
 
@@ -166,26 +166,28 @@ pub(crate) fn ensure_schema(conn: &Connection) -> DbResult<()> {
     }
 }
 
-pub(crate) const METRICS_ADDED_COLUMNS: [(&str, &str); 5] = [
+pub(crate) const METRICS_ADDED_COLUMNS: [(&str, &str); 6] = [
     ("session_id", "TEXT"),
     ("prompt_id", "TEXT"),
     ("content", "INTEGER"),
     ("always_on_chars", "INTEGER"),
     ("always_on_files", "TEXT"),
+    // Set only on a row drained from the spill; see `log_row`.
+    ("spill_key", "TEXT"),
 ];
 
 pub(crate) fn schema_complete(conn: &Connection) -> DbResult<bool> {
     let cols: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('metrics') WHERE name IN ('session_id','prompt_id','content','always_on_chars','always_on_files')",
+        "SELECT COUNT(*) FROM pragma_table_info('metrics') WHERE name IN ('session_id','prompt_id','content','always_on_chars','always_on_files','spill_key')",
         [],
         |r| r.get(0),
     )?;
     let idx: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'metrics_session_id'",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('metrics_session_id', 'metrics_spill_key')",
         [],
         |r| r.get(0),
     )?;
-    Ok(cols == METRICS_ADDED_COLUMNS.len() as i64 && idx == 1)
+    Ok(cols == METRICS_ADDED_COLUMNS.len() as i64 && idx == 2)
 }
 
 pub(crate) fn ensure_schema_inner(conn: &Connection) -> DbResult<()> {
@@ -224,9 +226,117 @@ pub(crate) fn ensure_schema_inner(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS metrics_session_id ON metrics(session_id, id);",
     )?;
+    // A drained row lands once even when the drain runs twice.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS metrics_spill_key ON metrics(spill_key) WHERE spill_key IS NOT NULL;",
+    )?;
     Ok(())
 }
 
+/// One metrics row, as a render produces it and as the spill keeps it.
+/// `ts` is None for a row written as it happens (SQLite stamps it); a spilled
+/// row carries the time of the render that produced it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct MetricsRow {
+    pub(crate) ts: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) prompt_id: Option<String>,
+    pub(crate) content: Option<i64>,
+    pub(crate) in_tokens: i64,
+    pub(crate) out_tokens: i64,
+    pub(crate) context_cap: i64,
+    pub(crate) context_pct: f64,
+    pub(crate) cost_usd: Option<f64>,
+    pub(crate) rate_5h_pct: Option<f64>,
+    pub(crate) rate_5h_resets: Option<i64>,
+    pub(crate) rate_7d_pct: Option<f64>,
+    pub(crate) rate_7d_resets: Option<i64>,
+    pub(crate) always_on_chars: Option<i64>,
+    pub(crate) always_on_files: Option<String>,
+}
+
+/// The numbers the duplicate check compares, with -1 for an absent value.
+type RowNumbers = (i64, i64, f64, f64, i64, i64);
+
+impl MetricsRow {
+    fn numbers(&self) -> RowNumbers {
+        (
+            self.in_tokens,
+            self.out_tokens,
+            self.rate_5h_pct.unwrap_or(-1.0),
+            self.rate_7d_pct.unwrap_or(-1.0),
+            self.content.unwrap_or(-1),
+            self.always_on_chars.unwrap_or(-1),
+        )
+    }
+}
+
+fn same_numbers(a: RowNumbers, b: RowNumbers) -> bool {
+    a.0 == b.0
+        && a.1 == b.1
+        && (a.2 - b.2).abs() < 0.01
+        && (a.3 - b.3).abs() < 0.01
+        && a.4 == b.4
+        && a.5 == b.5
+}
+
+const NUMBERS_SELECT: &str = "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1), COALESCE(content, -1), COALESCE(always_on_chars, -1)";
+
+fn read_numbers(r: &rusqlite::Row<'_>) -> rusqlite::Result<RowNumbers> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn metrics_row(
+    project: &str,
+    branch: Option<&str>,
+    model: Option<&str>,
+    session_id: Option<&str>,
+    prompt_id: Option<&str>,
+    content: Option<i64>,
+    in_tokens: i64,
+    out_tokens: i64,
+    context_cap: i64,
+    context_pct: f64,
+    cost_usd: Option<f64>,
+    five_hour: Option<&RateWindow>,
+    seven_day: Option<&RateWindow>,
+    always_on: Option<&AlwaysOn>,
+) -> MetricsRow {
+    MetricsRow {
+        ts: None,
+        project: Some(project.to_string()),
+        branch: branch.map(str::to_string),
+        model: model.map(str::to_string),
+        session_id: session_id.map(str::to_string),
+        prompt_id: prompt_id.map(str::to_string),
+        content,
+        in_tokens,
+        out_tokens,
+        context_cap,
+        context_pct,
+        cost_usd,
+        rate_5h_pct: five_hour.and_then(|w| w.used_percentage),
+        rate_5h_resets: five_hour.and_then(|w| w.resets_at),
+        rate_7d_pct: seven_day.and_then(|w| w.used_percentage),
+        rate_7d_resets: seven_day.and_then(|w| w.resets_at),
+        always_on_chars: always_on.map(|a| a.chars as i64),
+        always_on_files: always_on.and_then(|a| serde_json::to_string(&a.files).ok()),
+    }
+}
+
+/// `metrics_row` and `log_row` in one call, for tests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn log_metrics(
     conn: &Connection,
@@ -245,66 +355,72 @@ pub(crate) fn log_metrics(
     seven_day: Option<&RateWindow>,
     always_on: Option<&AlwaysOn>,
 ) -> DbResult<()> {
-    let last: Option<(i64, i64, f64, f64, i64, i64)> = conn
+    let row = metrics_row(
+        project,
+        branch,
+        model,
+        session_id,
+        prompt_id,
+        content,
+        in_tokens,
+        out_tokens,
+        context_cap,
+        context_pct,
+        cost_usd,
+        five_hour,
+        seven_day,
+        always_on,
+    );
+    log_row(conn, &row, None)
+}
+
+/// Insert `row` unless it repeats this session's last row. `spill_key` is
+/// set for a row drained from the spill: the shared file keeps it under a
+/// unique index, so draining the same row twice writes it once.
+pub(crate) fn log_row(
+    conn: &Connection,
+    row: &MetricsRow,
+    spill_key: Option<&str>,
+) -> DbResult<()> {
+    let last: Option<RowNumbers> = conn
         .query_row(
             // This session's last row, not the last row of any session: two
             // sessions reporting the same numbers back to back are two rows.
-            "SELECT in_tokens, out_tokens, COALESCE(rate_5h_pct, -1), COALESCE(rate_7d_pct, -1), COALESCE(content, -1), COALESCE(always_on_chars, -1) FROM metrics WHERE session_id IS ?1 ORDER BY id DESC LIMIT 1",
-            [session_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
+            &format!(
+                "{NUMBERS_SELECT} FROM metrics WHERE session_id IS ?1 ORDER BY id DESC LIMIT 1"
+            ),
+            [&row.session_id],
+            read_numbers,
         )
         .ok();
-    let cur_on: i64 = always_on.map(|a| a.chars as i64).unwrap_or(-1);
-    let on_files: Option<String> = always_on.and_then(|a| serde_json::to_string(&a.files).ok());
-
-    let cur_5h = five_hour.and_then(|w| w.used_percentage).unwrap_or(-1.0);
-    let cur_7d = seven_day.and_then(|w| w.used_percentage).unwrap_or(-1.0);
-    let cur_content = content.unwrap_or(-1);
-
-    if let Some((last_in, last_out, last_5h, last_7d, last_content, last_on)) = last
-        && last_in == in_tokens
-        && last_out == out_tokens
-        && (last_5h - cur_5h).abs() < 0.01
-        && (last_7d - cur_7d).abs() < 0.01
-        && last_content == cur_content
-        && last_on == cur_on
-    {
+    if last.is_some_and(|l| same_numbers(l, row.numbers())) {
         return Ok(());
     }
-
     conn.execute(
-        "INSERT INTO metrics (ts, project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files)
-         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT OR IGNORE INTO metrics (ts, project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files, spill_key)
+         VALUES (COALESCE(?1, strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         rusqlite::params![
-            project,
-            branch,
-            model,
-            session_id,
-            prompt_id,
-            content,
-            in_tokens,
-            out_tokens,
-            context_cap,
-            context_pct,
-            cost_usd,
-            five_hour.and_then(|w| w.used_percentage),
-            five_hour.and_then(|w| w.resets_at),
-            seven_day.and_then(|w| w.used_percentage),
-            seven_day.and_then(|w| w.resets_at),
-            always_on.map(|a| a.chars as i64),
-            on_files,
+            row.ts,
+            row.project,
+            row.branch,
+            row.model,
+            row.session_id,
+            row.prompt_id,
+            row.content,
+            row.in_tokens,
+            row.out_tokens,
+            row.context_cap,
+            row.context_pct,
+            row.cost_usd,
+            row.rate_5h_pct,
+            row.rate_5h_resets,
+            row.rate_7d_pct,
+            row.rate_7d_resets,
+            row.always_on_chars,
+            row.always_on_files,
+            spill_key,
         ],
     )?;
-
     Ok(())
 }
 
@@ -334,3 +450,342 @@ pub(crate) fn residue_deltas(conn: &Connection, session_id: &str, n: usize) -> D
     }
     Ok(turn_deltas(&newest_first, n))
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Spill: rows a render could not write to the shared file
+// ─────────────────────────────────────────────────────────────────────
+//
+// A render on a shared file (`metrics_db`) waits RENDER_PATIENCE for its
+// lock. When that runs out the row goes to the `metrics_spill` table of the
+// default local file under HOME instead of being dropped. That file is
+// already there for the default setup, is on local disk, uses WAL, and is
+// only ever opened by this machine, so writing to it does not meet the lock
+// that just timed out; a table in it needs no new file format.
+//
+// The next render that gets the shared lock drains the spill: in one
+// transaction it copies the oldest spilled rows for that shared file, then
+// writes its own row, and commits. Only after the commit does it delete
+// the copied rows from the spill. A crash between the commit and the delete
+// leaves rows that are in both files; each spilled row carries a random
+// `spill_key` that the shared file keeps under a unique index, so draining
+// them again inserts nothing. Deleting first would lose them instead.
+//
+// The spill holds every session's rows and any render drains them, oldest
+// first, so a session that ends right after a skipped render still has its
+// row delivered by the next render on the machine. A session's own rows
+// keep their order: its next render drains them before writing its own row.
+
+/// Spilled rows one render copies at most.
+pub(crate) const DRAIN_BATCH: i64 = 100;
+
+/// How long a render keeps copying spilled rows once it holds the shared
+/// lock. Other renders wait RENDER_PATIENCE for that lock, so a drain that
+/// held it for longer would make them spill in turn; well under half of it
+/// leaves room for the render's own row and the commit. At least one row is
+/// copied whatever the clock says, so a backlog always shrinks.
+pub(crate) const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The default local metrics file, where the spill lives.
+pub(crate) fn local_metrics_path(home: &str) -> String {
+    format!("{home}/.config/dbg/statusline-metrics.db")
+}
+
+pub(crate) fn open_local_metrics(home: &str) -> DbResult<Connection> {
+    let path = local_metrics_path(home);
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    open_metrics_at(&path, false, RENDER_PATIENCE)
+}
+
+pub(crate) fn ensure_spill(local: &Connection) -> DbResult<()> {
+    local.execute_batch(
+        "CREATE TABLE IF NOT EXISTS metrics_spill (
+            spill_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            target          TEXT NOT NULL, -- the shared file the row is for
+            spill_key       TEXT NOT NULL UNIQUE,
+            ts              TEXT NOT NULL,
+            project         TEXT,
+            branch          TEXT,
+            model           TEXT,
+            session_id      TEXT,
+            prompt_id       TEXT,
+            content         INTEGER,
+            in_tokens       INTEGER NOT NULL,
+            out_tokens      INTEGER NOT NULL,
+            context_cap     INTEGER NOT NULL,
+            context_pct     REAL NOT NULL,
+            cost_usd        REAL,
+            rate_5h_pct     REAL,
+            rate_5h_resets  INTEGER,
+            rate_7d_pct     REAL,
+            rate_7d_resets  INTEGER,
+            always_on_chars INTEGER,
+            always_on_files TEXT
+        );
+        CREATE INDEX IF NOT EXISTS metrics_spill_target ON metrics_spill(target, spill_id);",
+    )?;
+    Ok(())
+}
+
+/// Keep `row` for `target`, stamped now. A row that repeats this session's
+/// last spilled row is dropped, as the shared file would drop it.
+pub(crate) fn spill_row(local: &Connection, target: &str, row: &MetricsRow) -> DbResult<()> {
+    ensure_spill(local)?;
+    let last: Option<RowNumbers> = local
+        .query_row(
+            &format!(
+                "{NUMBERS_SELECT} FROM metrics_spill WHERE target = ?1 AND session_id IS ?2 ORDER BY spill_id DESC LIMIT 1"
+            ),
+            rusqlite::params![target, row.session_id],
+            read_numbers,
+        )
+        .ok();
+    if last.is_some_and(|l| same_numbers(l, row.numbers())) {
+        return Ok(());
+    }
+    local.execute(
+        "INSERT INTO metrics_spill (target, spill_key, ts, project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files)
+         VALUES (?1, ?2, COALESCE(?3, strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        rusqlite::params![
+            target,
+            mint_id(),
+            row.ts,
+            row.project,
+            row.branch,
+            row.model,
+            row.session_id,
+            row.prompt_id,
+            row.content,
+            row.in_tokens,
+            row.out_tokens,
+            row.context_cap,
+            row.context_pct,
+            row.cost_usd,
+            row.rate_5h_pct,
+            row.rate_5h_resets,
+            row.rate_7d_pct,
+            row.rate_7d_resets,
+            row.always_on_chars,
+            row.always_on_files,
+        ],
+    )?;
+    Ok(())
+}
+
+/// A row waiting in the spill.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Spilled {
+    pub(crate) spill_id: i64,
+    pub(crate) spill_key: String,
+    pub(crate) row: MetricsRow,
+}
+
+/// The oldest `limit` spilled rows for `target`; none when there is no spill.
+pub(crate) fn read_spill(local: &Connection, target: &str, limit: i64) -> DbResult<Vec<Spilled>> {
+    let has: i64 = local.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics_spill'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = local.prepare(
+        "SELECT spill_id, spill_key, ts, project, branch, model, session_id, prompt_id, content, in_tokens, out_tokens, context_cap, context_pct, cost_usd, rate_5h_pct, rate_5h_resets, rate_7d_pct, rate_7d_resets, always_on_chars, always_on_files
+         FROM metrics_spill WHERE target = ?1 ORDER BY spill_id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![target, limit], |r| {
+        Ok(Spilled {
+            spill_id: r.get(0)?,
+            spill_key: r.get(1)?,
+            row: MetricsRow {
+                ts: r.get(2)?,
+                project: r.get(3)?,
+                branch: r.get(4)?,
+                model: r.get(5)?,
+                session_id: r.get(6)?,
+                prompt_id: r.get(7)?,
+                content: r.get(8)?,
+                in_tokens: r.get(9)?,
+                out_tokens: r.get(10)?,
+                context_cap: r.get(11)?,
+                context_pct: r.get(12)?,
+                cost_usd: r.get(13)?,
+                rate_5h_pct: r.get(14)?,
+                rate_5h_resets: r.get(15)?,
+                rate_7d_pct: r.get(16)?,
+                rate_7d_resets: r.get(17)?,
+                always_on_chars: r.get(18)?,
+                always_on_files: r.get(19)?,
+            },
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Remove rows the shared file now holds.
+pub(crate) fn delete_spilled(local: &Connection, done: &[Spilled]) -> DbResult<()> {
+    local.execute_batch("BEGIN IMMEDIATE;")?;
+    let inner = || -> DbResult<()> {
+        let mut del = local.prepare("DELETE FROM metrics_spill WHERE spill_id = ?1")?;
+        for s in done {
+            del.execute([s.spill_id])?;
+        }
+        Ok(())
+    };
+    match inner().and_then(|()| Ok(local.execute_batch("COMMIT;")?)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = local.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+/// Spill `row` for `target`, retrying a busy local file within
+/// RENDER_PATIENCE. Several renders that all just timed out on the shared
+/// file spill at once, and a WAL file can answer BUSY without waiting (a
+/// connection opening it while another one closes it, say), so the busy
+/// timeout alone does not cover every case.
+pub(crate) fn keep_locally(home: &str, target: &str, row: &MetricsRow) -> DbResult<()> {
+    let deadline = std::time::Instant::now() + RENDER_PATIENCE;
+    loop {
+        match open_local_metrics(home).and_then(|l| spill_row(&l, target, row)) {
+            Err(e) if is_busy(e.as_ref()) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            r => return r,
+        }
+    }
+}
+
+/// In one transaction on the shared file: the spilled rows in order, as many
+/// as `budget` allows (at least one), then `own`. Returns how many spilled
+/// rows, from the front, the shared file now holds. A spilled row the shared
+/// file refuses for any reason other than a lock undoes the whole drain but
+/// not `own`: a bad row in the spill never costs a render its row.
+pub(crate) fn write_with_drain(
+    shared: &Connection,
+    spilled: &[Spilled],
+    own: &MetricsRow,
+    budget: std::time::Duration,
+) -> DbResult<usize> {
+    shared.execute_batch("BEGIN IMMEDIATE;")?;
+    let start = std::time::Instant::now();
+    let inner = || -> DbResult<usize> {
+        let mut done = 0;
+        if !spilled.is_empty() {
+            shared.execute_batch("SAVEPOINT drain;")?;
+            for s in spilled {
+                if done > 0 && start.elapsed() >= budget {
+                    break;
+                }
+                if log_row(shared, &s.row, Some(&s.spill_key)).is_err() {
+                    shared.execute_batch("ROLLBACK TO drain;")?;
+                    done = 0;
+                    break;
+                }
+                done += 1;
+            }
+            shared.execute_batch("RELEASE drain;")?;
+        }
+        log_row(shared, own, None)?;
+        shared.execute_batch("COMMIT;")?;
+        Ok(done)
+    };
+    match inner() {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            let _ = shared.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+/// Write this render's row to `shared` (a `metrics_db` file), draining the
+/// spill for it first. Rows are deleted from the spill only after the
+/// shared file has committed them.
+pub(crate) fn write_shared(
+    shared: &Connection,
+    home: &str,
+    target: &str,
+    own: &MetricsRow,
+) -> DbResult<()> {
+    // No local file yet means nothing was ever spilled: skip opening it.
+    let local = if std::path::Path::new(&local_metrics_path(home)).exists() {
+        open_local_metrics(home).ok()
+    } else {
+        None
+    };
+    let spilled = local
+        .as_ref()
+        .and_then(|l| read_spill(l, target, DRAIN_BATCH).ok())
+        .unwrap_or_default();
+    let n = write_with_drain(shared, &spilled, own, DRAIN_BUDGET)?;
+    if n > 0
+        && let Some(l) = &local
+    {
+        // A failure here leaves rows the next drain finds already written.
+        let _ = delete_spilled(l, &spilled[..n]);
+    }
+    Ok(())
+}
+
+/// Record this render's row. Returns the metrics connection, for the
+/// residue line, and whether the database was busy or locked.
+///
+/// On the default local file a busy file skips the row, as it always did.
+/// On a shared file a busy file at open or at insert sends the row to the
+/// spill; the render still shows `db:locked` and prints one stderr line,
+/// because a lock that stays stuck must stay visible.
+pub(crate) fn record_render(
+    cfg: &Config,
+    home: &str,
+    row: &MetricsRow,
+) -> (Option<Connection>, bool) {
+    // A shared path that is the local file itself has nowhere else to go.
+    let target = metrics_db_path(cfg, home)
+        .ok()
+        .filter(|(p, shared)| *shared && *p != local_metrics_path(home))
+        .map(|(p, _)| p);
+    let report = |e: &(dyn std::error::Error + 'static), what: &str| -> bool {
+        let busy = is_busy(e);
+        match &target {
+            Some(t) if busy => match keep_locally(home, t, row) {
+                Ok(()) => eprintln!(
+                    "claude-statusline-rust: metrics row kept locally until the shared file is free: {e}"
+                ),
+                Err(e2) => eprintln!(
+                    "claude-statusline-rust: {what}: {e}; keeping it locally failed: {e2}"
+                ),
+            },
+            // The shared file is unreachable for another reason: this row
+            // is skipped, never forced. One line, so a hook or a log shows it.
+            _ if cfg.metrics_db.is_some() => eprintln!("claude-statusline-rust: {what}: {e}"),
+            _ => {}
+        }
+        busy
+    };
+    let conn = match open_metrics_db(cfg, home) {
+        Ok(c) => c,
+        Err(e) => return (None, report(e.as_ref(), "metrics skipped")),
+    };
+    let written = match &target {
+        Some(t) => write_shared(&conn, home, t, row),
+        None => log_row(&conn, row, None),
+    };
+    let busy = match &written {
+        Ok(()) => false,
+        Err(e) => report(e.as_ref(), "metrics row skipped"),
+    };
+    (Some(conn), busy)
+}
+
+#[cfg(test)]
+#[path = "spill_tests.rs"]
+mod spill_tests;

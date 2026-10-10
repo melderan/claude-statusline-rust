@@ -160,6 +160,12 @@ fn first_renders_of_a_new_shared_file_all_write() {
     // makes every one of them a first render and makes the race certain:
     // with only 50 ms of patience all eight would skip. It is released well
     // inside the 1 s a first render waits.
+    //
+    // On a slow machine a render can start after the first one has given
+    // the file its header, and then waits only 50 ms. Such a render keeps
+    // its row locally and the next render writes it, so the promise is that
+    // all eight rows are there after one more render, not that none of the
+    // eight gave up.
     for round in 0..3 {
         let dir = fresh_dir(&format!("first{round}"));
         let db = dir.join("m.db").to_string_lossy().to_string();
@@ -177,9 +183,20 @@ fn first_renders_of_a_new_shared_file_all_write() {
             })
             .filter(|e| !e.is_empty())
             .collect();
+        let (code, err, _) = render(&dir, &db, &hook(8));
+        assert_eq!(
+            (code, err.as_str()),
+            (0, ""),
+            "round {round}: the quiet render"
+        );
         let n = rows(&db);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(errs.is_empty(), "round {round}: {errs:?}");
-        assert_eq!(n, 8, "round {round}: every first render writes its row");
+        for e in &errs {
+            assert!(
+                e.contains("kept locally"),
+                "round {round}: a first render that gave up kept its row: {e:?}"
+            );
+        }
+        assert_eq!(n, 9, "round {round}: every first render's row is written");
     }
 }
