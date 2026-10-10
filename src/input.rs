@@ -139,7 +139,13 @@ pub(crate) struct CurrentUsage {
 #[derive(Deserialize)]
 pub(crate) struct Cost {
     pub(crate) total_cost_usd: Option<f64>,
+    /// Wall-clock time the session has run.
     pub(crate) total_duration_ms: Option<i64>,
+    /// Time spent inside API calls; compared with the wall time it says how
+    /// much of the session was waiting on the model.
+    pub(crate) total_api_duration_ms: Option<i64>,
+    pub(crate) total_lines_added: Option<i64>,
+    pub(crate) total_lines_removed: Option<i64>,
 }
 
 #[derive(Deserialize)]

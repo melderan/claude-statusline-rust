@@ -56,12 +56,20 @@ pub(crate) mod rank {
     pub(crate) const PROJECT_MEM: u8 = 11;
     pub(crate) const PROJECT_ON: u8 = 12;
     pub(crate) const PROJECT_DUR: u8 = 13;
+    /// Both of these say something about the session's work, the duration's
+    /// close neighbours, so they outlast it: a narrow line keeps `dur:`
+    /// before `+n -n`, and `+n -n` before `api:`. The lines count goes
+    /// first of the two because it is a running total of output that the
+    /// editor or the diff shows anyway, while the API share is visible
+    /// nowhere else.
+    pub(crate) const PROJECT_LINES: u8 = 14;
+    pub(crate) const PROJECT_API: u8 = 15;
     /// git tail: the age, then the PR tag.
-    pub(crate) const GIT_AGE: u8 = 14;
-    pub(crate) const GIT_PR: u8 = 15;
+    pub(crate) const GIT_AGE: u8 = 16;
+    pub(crate) const GIT_PR: u8 = 17;
     /// Heads, last to go: git, then ctx. The project head is KEEP.
-    pub(crate) const GIT_HEAD: u8 = 16;
-    pub(crate) const CTX_HEAD: u8 = 17;
+    pub(crate) const GIT_HEAD: u8 = 18;
+    pub(crate) const CTX_HEAD: u8 = 19;
 }
 
 /// A run of text inside a row, with the place it takes in the drop order.
@@ -263,8 +271,29 @@ pub(crate) fn build_lines(data: &Input, cfg: &Config, env: &Env) -> Lines {
     lines
 }
 
+/// Lines added and removed this session, or `None` when neither count is
+/// present or both are zero (a fresh session shows nothing). A count that is
+/// missing beside a present one reads as zero; a negative one is clamped.
+fn lines_changed(cost: &Cost) -> Option<(i64, i64)> {
+    if cost.total_lines_added.is_none() && cost.total_lines_removed.is_none() {
+        return None;
+    }
+    let added = cost.total_lines_added.unwrap_or(0).max(0);
+    let removed = cost.total_lines_removed.unwrap_or(0).max(0);
+    (added > 0 || removed > 0).then_some((added, removed))
+}
+
+/// Share of the wall time spent inside API calls, as a rounded percentage.
+/// `None` unless both durations are present and the wall time is above zero.
+/// It can pass 100 when calls overlap; the value is shown as it comes.
+fn api_share_percent(cost: &Cost) -> Option<i64> {
+    let wall = cost.total_duration_ms.filter(|w| *w > 0)?;
+    let api = cost.total_api_duration_ms?.max(0);
+    Some((api as f64 * 100.0 / wall as f64).round() as i64)
+}
+
 /// Head: project path (tilde form, with `cd` suffix) and model. Tail: CC
-/// version, duration, memory sizes, always-on size.
+/// version, duration, lines changed, API share, memory sizes, always-on size.
 fn project_row(data: &Input, cfg: &Config, env: &Env, project_dir: &str, current_dir: &str) -> Row {
     let rst = reset(cfg);
     let mut row = Row::default();
@@ -305,6 +334,30 @@ fn project_row(data: &Input, cfg: &Config, env: &Env, project_dir: &str, current
         row.push_tail(
             format!(" {}|{} {}{}", c(cfg, DIM), rst, label, fmt_duration_ms(ms)),
             rank::PROJECT_DUR,
+        );
+    }
+
+    if let Some((added, removed)) = data.cost.as_ref().and_then(lines_changed) {
+        row.push_tail(
+            format!(
+                " {}|{} {}+{}{} {}-{}{}",
+                c(cfg, DIM),
+                rst,
+                c(cfg, GREEN),
+                added,
+                rst,
+                c(cfg, ROSE),
+                removed,
+                rst
+            ),
+            rank::PROJECT_LINES,
+        );
+    }
+
+    if let Some(pct) = data.cost.as_ref().and_then(api_share_percent) {
+        row.push_tail(
+            format!(" {}|{} api:{}%", c(cfg, DIM), rst, pct),
+            rank::PROJECT_API,
         );
     }
 
