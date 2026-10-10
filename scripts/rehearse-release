@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Rehearse a release in a throwaway clone: the real script, an unsigned tag, nothing pushed.
+# Usage: scripts/rehearse-release X.Y.Z
+# It clones the current branch, adds a scratch changelog entry when [Unreleased] is empty,
+# points the clone's upstream at itself, runs scripts/release X.Y.Z --no-sign --allow-branch,
+# and checks that CHANGELOG.md, Cargo.toml and Cargo.lock keep their modes. Exit 0 means the
+# release path works on this tree; the clone is removed unless KEEP=1.
+set -euo pipefail
+[ $# -eq 1 ] || { sed -n '2,3p' "$0" | sed 's/^# //'; exit 2; }
+version="$1"
+src="$(git rev-parse --show-toplevel)"
+branch="$(git -C "$src" rev-parse --abbrev-ref HEAD)"
+dir="$(mktemp -d "${TMPDIR:-/tmp}/rehearse-release.XXXXXX")"
+trap '[ "${KEEP:-0}" = 1 ] && echo "rehearse-release: clone kept at $dir" || rm -rf "$dir"' EXIT
+git clone -q --branch "$branch" "$src" "$dir"
+cd "$dir"
+git config user.name rehearsal
+git config user.email rehearsal@example.invalid
+git config commit.gpgsign false
+entries="$(awk '/^## \[Unreleased\]/ { on = 1; next } /^## \[/ { on = 0 } on && /^- / { n++ } END { print n + 0 }' CHANGELOG.md)"
+if [ "$entries" -eq 0 ]; then
+  awk '/^## \[Unreleased\]/ { print; print ""; print "- Rehearsal entry."; next } { print }' CHANGELOG.md >CHANGELOG.tmp
+  cat CHANGELOG.tmp >CHANGELOG.md && rm -f CHANGELOG.tmp
+  git commit -qam "rehearsal: changelog entry"
+  echo "rehearse-release: [Unreleased] was empty; added a scratch entry in the clone"
+fi
+git branch -f rehearsal-upstream HEAD
+git config "branch.$branch.remote" .
+git config "branch.$branch.merge" refs/heads/rehearsal-upstream
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+before="$(mode_of CHANGELOG.md) $(mode_of Cargo.toml) $(mode_of Cargo.lock)"
+scripts/release "$version" --no-sign --allow-branch
+after="$(mode_of CHANGELOG.md) $(mode_of Cargo.toml) $(mode_of Cargo.lock)"
+[ "$before" = "$after" ] || { echo "rehearse-release: file modes changed: $before -> $after" >&2; exit 1; }
+echo "rehearse-release: ok, v$version cut in the clone, modes $after, nothing pushed"
