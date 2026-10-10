@@ -4,6 +4,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-10
+
 ### Added
 
 - `cargo binstall` metadata in `Cargo.toml`, so `cargo binstall claude-statusline-rust --git <repo>` fetches the release archive for the host instead of compiling.
