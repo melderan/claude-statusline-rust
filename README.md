@@ -85,7 +85,7 @@ The program reads `COLUMNS` from its environment (80 when unset). Below 60 colum
 ### Project line
 
 ```
-~/code/my-app | cd:src | Fable 5.1 | CC:2.1.292 | dur:1h12m | mem:2KB+9KB | on:4.8kch
+~/code/my-app | cd:src | Fable 5.1 | CC:2.1.292 | dur:1h12m | +288 -47 | api:11% | mem:2KB+9KB | on:4.8kch
 ```
 
 - `~/code/my-app`: `workspace.project_dir`, with your home directory written as `~`.
@@ -93,6 +93,8 @@ The program reads `COLUMNS` from its environment (80 when unset). Below 60 colum
 - `Fable 5.1`: `model.display_name` without a leading "Claude ".
 - `CC:2.1.292`: the Claude Code `version`.
 - `dur:1h12m`: `cost.total_duration_ms`, the wall-clock time the session has run.
+- `+288 -47`: `cost.total_lines_added` and `cost.total_lines_removed`, the lines of code added and removed this session; the plus is green and the minus red. Hidden when neither count is present or both are zero, so a fresh session shows nothing. A count missing beside a present one reads as zero.
+- `api:11%`: `cost.total_api_duration_ms` as a share of `cost.total_duration_ms`, rounded: how much of the session was spent waiting on the model. Hidden unless both are present and the wall-clock time is above zero. It can pass 100% when calls overlap.
 - `mem:2KB+9KB`: bytes on disk under `~/.claude/projects/<project path with / replaced by ->/memory`. The first number is the top-level `MEMORY.md`, which Claude Code loads at session start. The second is every other `.md` file below it, which Claude Code reaches only by search. Units are bytes so they cannot be mistaken for tokens.
 - `on:4.8kch`: characters (`ch`, not tokens) in the text Claude Code loads into every turn: `~/.claude/CLAUDE.md`, each `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` from the project directory up to the filesystem root, their `@path` imports (five levels deep at most), and that `MEMORY.md`. Files over 4 MiB and non-regular files are skipped. Roughly four characters make a token in English text.
 
@@ -171,7 +173,7 @@ When this render's metrics row was skipped because the database was busy or lock
 ~/code/my-app | Opus 4.6 | CC:2.1.0 | dur:1h02m | ctx 43% (86k/200k) | $1.23 | git: main (3h) *
 ```
 
-Set `lines` to `one` (or `CSR_LINES=one`) and every line above is joined into a single row with ` | `, in the same order. When the row is wider than `COLUMNS`, pieces are dropped from the least important up until it fits: the residue numbers first, then the 7d and 5h windows, the activity line, the misc tags, the `db:locked` marker, the tail of the ctx line (cache, then `last in/out`, then cost), the tail of the project line (version, memory, always-on size, duration), and the tail of the git line (age, then PR state). The project path and model, the ctx percentage and the branch stay the longest; the project path is never dropped, so on a very narrow terminal it is clipped rather than lost. The default `multi` prints one line per kind of information as shown above.
+Set `lines` to `one` (or `CSR_LINES=one`) and every line above is joined into a single row with ` | `, in the same order. When the row is wider than `COLUMNS`, pieces are dropped from the least important up until it fits: the residue numbers first, then the 7d and 5h windows, the activity line, the misc tags, the `db:locked` marker, the tail of the ctx line (cache, then `last in/out`, then cost), the tail of the project line (version, memory, always-on size, duration, lines changed, API share), and the tail of the git line (age, then PR state). The project path and model, the ctx percentage and the branch stay the longest; the project path is never dropped, so on a very narrow terminal it is clipped rather than lost. The default `multi` prints one line per kind of information as shown above.
 
 ## Configuration
 
