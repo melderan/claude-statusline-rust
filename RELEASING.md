@@ -24,6 +24,9 @@ Versions follow `VERSIONING.md`: strict Semantic Versioning, one annotated signe
 
 A release candidate is `just tag X.Y.Z-rc.1`; the workflow marks its GitHub release as a pre-release.
 
+
+Before a real release, rehearse it: `scripts/rehearse-release X.Y.Z` clones the current branch into a temporary directory, adds a scratch changelog entry if `[Unreleased]` is empty, runs the real release script there with an unsigned tag, and checks the file modes. It builds and tests in release mode, so it takes a few minutes. Two bugs in the release path were found this way before they reached a tag.
+
 ## What the tag triggers
 
 The release workflow first verifies the tag: it matches `vX.Y.Z` exactly, it is annotated and signed, its commit is on `main`, the version in `Cargo.toml` and `Cargo.lock` is the same, and `CHANGELOG.md` has a `## [X.Y.Z]` heading. Any of those failing stops the release before anything is built.

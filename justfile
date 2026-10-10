@@ -72,3 +72,7 @@ check: test lint
 # Clean build artifacts
 clean:
     cargo clean
+
+# Rehearse a release in a throwaway clone (unsigned tag, nothing pushed)
+rehearse version:
+    scripts/rehearse-release {{ version }}
