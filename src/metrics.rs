@@ -495,7 +495,19 @@ pub(crate) fn open_local_metrics(home: &str) -> DbResult<Connection> {
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    open_metrics_at(&path, false, RENDER_PATIENCE)
+    let conn = open_metrics_at(&path, false, RENDER_PATIENCE)?;
+    // The last connection to close a WAL file checkpoints it, holding the
+    // file exclusively through an fsync. On a busy disk that fsync outlasts
+    // RENDER_PATIENCE, and the renders spilling at the same moment, all of
+    // which just gave up on the shared file, failed to keep their rows. The
+    // spill's connections skip that checkpoint; SQLite's automatic one, which
+    // runs after a commit without blocking readers or writers, still keeps
+    // the WAL to about a thousand pages.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )?;
+    Ok(conn)
 }
 
 pub(crate) fn ensure_spill(local: &Connection) -> DbResult<()> {

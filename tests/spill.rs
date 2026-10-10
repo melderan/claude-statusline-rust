@@ -71,6 +71,18 @@ fn rows(db: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Rows still waiting in the local spill, not set aside as refused.
+fn spill_left(home: &std::path::Path) -> i64 {
+    let local = home.join(".config/dbg/statusline-metrics.db");
+    let conn = rusqlite::Connection::open(local).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM metrics_spill WHERE failed IS NULL",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
 #[test]
 fn renders_under_a_held_lock_show_the_marker_and_their_rows_land_later() {
     let dir = fresh_dir("held");
@@ -109,6 +121,7 @@ fn concurrent_renders_on_a_busy_shared_file_lose_no_rows() {
     let lock = format!("{db}.lock");
     let mut renders = 1;
     let mut gave_up = 0;
+    let mut odd: Vec<String> = Vec::new();
     for round in 0..5 {
         std::fs::create_dir_all(&lock).unwrap();
         let children: Vec<Child> = (0..8)
@@ -123,14 +136,19 @@ fn concurrent_renders_on_a_busy_shared_file_lose_no_rows() {
         std::thread::sleep(Duration::from_millis(100));
         std::fs::remove_dir(&lock).unwrap();
         for c in children {
-            let (out, _) = finish(c);
+            let (out, err) = finish(c);
             renders += 1;
             gave_up += usize::from(out.contains("db:locked"));
+            if !err.is_empty() && !err.contains("kept locally until") {
+                odd.push(err);
+            }
         }
     }
     assert!(gave_up > 0, "the held lock made some renders give up");
+    let mut quiet_locked = 0;
     for s in 0..8 {
-        render(&dir, &db, &hook(&format!("s{s}"), "last", 9000 + s));
+        let (out, _) = render(&dir, &db, &hook(&format!("s{s}"), "last", 9000 + s));
+        quiet_locked += usize::from(out.contains("db:locked"));
         renders += 1;
     }
     let all = rows(&db);
@@ -138,10 +156,11 @@ fn concurrent_renders_on_a_busy_shared_file_lose_no_rows() {
     keys.sort();
     keys.dedup();
     assert_eq!(keys.len(), all.len(), "no row twice");
+    let left = spill_left(&dir);
     assert_eq!(
         all.len(),
         renders,
-        "every render's row is in the shared file"
+        "every render's row is in the shared file; spill left {left}, quiet renders locked {quiet_locked}, gave up {gave_up}, other stderr {odd:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
