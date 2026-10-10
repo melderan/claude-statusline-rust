@@ -203,6 +203,25 @@ Set `metrics_db` (or `CSR_METRICS_DB`) to use another file, for example one on a
 
 `claude-statusline-rust --flush` copies local rows into a shared recorder database: a SQLite file that several machines or containers write into. It copies only rows newer than the last flush, in batches, and is safe to repeat. It needs `CSR_RECORDER_DB` (the recorder path) and an instance name in `CSR_ROOM`, falling back to `SANDBOX_NAME`; without either it prints a message and does nothing. It always exits 0 so it can run from a Stop hook. It creates a `measures` table in the recorder and refuses an existing one whose unique key differs. Each lock the flush takes, on the local file or the recorder, waits up to 3 seconds; a lock held throughout makes it give up after about 3 seconds. The flush takes those locks one step after another, so one that meets a busy file at more than one step can take a multiple of that, about 6 seconds when the local file and then the recorder are each busy for most of their wait.
 
+## Usage report
+
+`claude-statusline-rust --report [WINDOW]` prints a plain-text report from the metrics file. `WINDOW` is `24h` (the default), `7d` or `30d`; anything else prints a usage line to stderr and exits 2. It reads the same file the renders write (`metrics_db` or `CSR_METRICS_DB` included), writes nothing to it, and uses no colour.
+
+```
+$ claude-statusline-rust --report 7d
+Usage, last 7d (times UTC)
+start        end            dur  project  model      turns        peak ctx   cost  last in/out
+10-06 22:21  10-07 00:50  2h28m  my-app   Fable 5.1      3  38% 380k/1000k  $6.20       240k/4
+10-08 22:55  10-09 00:21  1h26m  notes    Fable 5.1      2  12% 120k/1000k  $0.85       120k/4
+23:21        00:50        1h29m  my-app   Fable 5.1      2  24% 236k/1000k  $3.10       236k/4
+Total: 3 sessions, 7 turns, $10.15, 10-06 22:21 to 00:50 (3d02h)
+Rate limits: 5h 42% (resets 03:04), 7d 18% (resets 10-15 00:51); 5h peak in window 42%
+```
+
+There is one line per session, the one that started last at the bottom. Times are UTC: `HH:MM` within the last 24 hours, `MM-DD HH:MM` otherwise. `turns` counts distinct prompt ids (a row with no prompt id counts as one turn). `peak ctx` is the highest context percentage with the input tokens of that row and the window size. `cost` is the session's last recorded cost: the hook reports a running total, so rows are never summed, and the totals line adds one value per session. A session that began before the window is listed from its first row inside it but keeps its full running cost. `last in/out` are the last row's token counts. The rate-limit line appears when a row in the window has a five-hour percentage: it shows the latest readings and the highest five-hour percentage in the window.
+
+Lines stay within 100 columns by shortening the project name, then the model name; times, counts and costs are never cut. An empty window prints one line saying so. A missing metrics file prints one line naming its path and exits 0, and a file that stays busy or locked for the 3-second wait prints one line to stderr and exits 0; the report never creates the file or removes a lock. Any other failure prints one line to stderr and exits 1.
+
 ## Compatibility
 
 The voice segment reads an optional per-session JSON card written by the separate project [claude-code-tts](https://github.com/melderan/claude-code-tts), at `~/.claude-tts/voice.d/<session>.json`. The session is `$CLAUDE_TTS_SESSION` if set, otherwise the project path with every character other than an ASCII letter or digit turned into `-`. Only card schema 1 with a persona is used. It renders as `voice: <persona> (<voice>) <speed>x`, with ` muted` appended when muted. No card means no segment, and nothing else in this program depends on that project.
