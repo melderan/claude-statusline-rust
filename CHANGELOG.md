@@ -8,6 +8,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 - `cargo binstall` metadata in `Cargo.toml`, so `cargo binstall claude-statusline-rust --git <repo>` fetches the release archive for the host instead of compiling.
 - Project line: `+288 -47` (lines added and removed, from `cost.total_lines_added` and `cost.total_lines_removed`; hidden when both are zero or absent) and `api:11%` (`cost.total_api_duration_ms` as a share of `cost.total_duration_ms`; hidden without both or at zero wall time). Both follow the duration, and in one-line mode they are dropped after it, the lines count first.
+- `claude-statusline-rust --report [24h|7d|30d]`: a plain-text usage report from the metrics file, with one line per session (times, duration, project, model, turns, peak context, cost, last token counts), a totals line and the rate-limit readings. A missing or empty file or a busy lock gives one line and exit 0; an unknown window gives a usage line and exit 2.
 
 ### Fixed
 

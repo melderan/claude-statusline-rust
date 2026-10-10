@@ -14,6 +14,7 @@ mod lines;
 mod memory;
 mod metrics;
 mod render;
+mod report;
 #[cfg(test)]
 mod tests;
 mod voice;
@@ -29,6 +30,7 @@ use lines::*;
 use memory::*;
 use metrics::*;
 use render::*;
+use report::*;
 use voice::*;
 
 const HELP: &str = "\
@@ -39,6 +41,9 @@ Configure it in ~/.claude/settings.json under \"statusLine\".
 
     --version    print the program name and version
     --flush      copy local metrics rows into a shared recorder database
+    --report [WINDOW]
+                 print a usage report from the metrics file; WINDOW is 24h
+                 (default), 7d or 30d
     --help       this text
 
 Settings: ~/.config/claude-statusline-rust/config.json, or CSR_* variables.
@@ -56,6 +61,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--flush") {
         flush_main();
+        return;
+    }
+    if args.iter().any(|a| a == "--report") {
+        report_main(&args);
         return;
     }
     let mut buf = String::with_capacity(4096);
