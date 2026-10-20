@@ -4,6 +4,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- Fuel file: with `fuel_file` or `CSR_FUEL_FILE` set, each render writes the ctx line's context use (`used_pct`, `used_tokens`, `window_tokens`, `session_id`, `as_of`, `source`, plus any `fuel_labels` / `CSR_FUEL_LABELS` fields) to that path as JSON, atomically and mode 0644. A render that matches a file under 60 seconds old skips the write. `claude-statusline-rust --fuel [PATH]` prints it as one line: `fuel: 13.1% of 1000k tokens, as of <UTC>`.
+
 ## [1.2.0] - 2026-10-10
 
 ### Added

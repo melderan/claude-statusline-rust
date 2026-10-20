@@ -8,6 +8,7 @@ mod busy;
 mod config;
 mod extras;
 mod flush;
+mod fuel;
 mod git;
 mod input;
 mod lines;
@@ -24,6 +25,7 @@ use busy::*;
 use config::*;
 use extras::*;
 use flush::*;
+use fuel::*;
 use git::*;
 use input::*;
 use lines::*;
@@ -44,6 +46,9 @@ Configure it in ~/.claude/settings.json under \"statusLine\".
     --report [WINDOW]
                  print a usage report from the metrics file; WINDOW is 24h
                  (default), 7d or 30d
+    --fuel [PATH]
+                 print one line from the fuel file at PATH (default: the
+                 configured fuel_file): context used, window, and when
     --help       this text
 
 Settings: ~/.config/claude-statusline-rust/config.json, or CSR_* variables.
@@ -65,6 +70,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--report") {
         report_main(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--fuel") {
+        fuel_main(&args);
         return;
     }
     let mut buf = String::with_capacity(4096);
@@ -128,6 +137,7 @@ fn main() {
     // the stderr line is rarely read. On a shared file the row is kept
     // locally and written by a later render; on the local file it is skipped.
     let (conn, db_locked) = record_render(&cfg, &home, &row);
+    record_fuel(&cfg, &home, &data);
     // The residue line reads the metrics file only, not rows still waiting
     // locally: those reach the shared file, ahead of the next render's own
     // row, at the first render that gets the lock, and a render that kept

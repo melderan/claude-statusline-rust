@@ -192,6 +192,8 @@ Settings come from `~/.config/claude-statusline-rust/config.json`, then environm
 | `activity` | `CSR_ACTIVITY` | `true` | The activity line from the transcript. |
 | `lines` | `CSR_LINES` | `multi` | `multi` or `one`; see One-line mode. Anything else is ignored. |
 | `compact_reserve` | `CSR_COMPACT_RESERVE` | `33000` | Tokens kept free at the compaction point; negative turns the `compact in` marker off. |
+| `fuel_file` | `CSR_FUEL_FILE` | unset | Path of a fuel file; see Fuel file. |
+| `fuel_labels` | `CSR_FUEL_LABELS` | none | Extra string fields for the fuel file: a JSON object in the config file, `key=value,key=value` in the variable. |
 
 ## Metrics database
 
@@ -221,6 +223,25 @@ Rate limits: 5h 42% (resets 03:04), 7d 18% (resets 10-15 00:51); 5h peak in wind
 There is one line per session, the one that started last at the bottom. Times are UTC: `HH:MM` within the last 24 hours, `MM-DD HH:MM` otherwise. `turns` counts distinct prompt ids (a row with no prompt id counts as one turn). `peak ctx` is the highest context percentage with the input tokens of that row and the window size. `cost` is the session's last recorded cost: the hook reports a running total, so rows are never summed, and the totals line adds one value per session. A session that began before the window is listed from its first row inside it but keeps its full running cost. `last in/out` are the last row's token counts. The rate-limit line appears when a row in the window has a five-hour percentage: it shows the latest readings and the highest five-hour percentage in the window.
 
 Lines stay within 100 columns by shortening the project name, then the model name; times, counts and costs are never cut. An empty window prints one line saying so. A missing metrics file prints one line naming its path and exits 0, and a file that stays busy or locked for the 3-second wait prints one line to stderr and exits 0; the report never creates the file or removes a lock. Any other failure prints one line to stderr and exits 1.
+
+## Fuel file
+
+Set `fuel_file` (or `CSR_FUEL_FILE`) and each render writes the context use it shows on the ctx line to that path as JSON, so another program can tell how full a session's context is without parsing the status line:
+
+```
+{"as_of":"2026-10-20T18:43:43.072Z","host":"laptop","session_id":"dc634416-…","source":"statusline","used_pct":13.1,"used_tokens":131065,"window_tokens":1000000}
+```
+
+`used_tokens` and `used_pct` are the ctx line's numbers: the tokens of the last response plus the fixed baseline, so `used_pct` can read a little above Claude Code's own `used_percentage`, which is used only when the payload has no token counts. Labels from `fuel_labels` (`host` above) come first and can never replace a measured field. The file is written to a temporary file in the same directory and renamed, so a reader sees a whole file, with mode 0644. Before the first response of a session, when nothing is known, nothing is written, so a reader that finds no file should take it as "not started yet", not as 0%. The hook runs several times a second, so a render whose session and token counts match a file less than 60 seconds old leaves it alone; `as_of` is therefore at most a minute behind while the numbers hold still. Paths resolve as `metrics_db` does. A failed write prints one line to stderr and leaves the status line as it was. Several sessions given the same path take turns: the last render wins. A sub-agent has no status line, so its context never shows here.
+
+`claude-statusline-rust --fuel [PATH]` prints that file as one line, reading `PATH` or the configured `fuel_file`:
+
+```
+$ claude-statusline-rust --fuel
+fuel: 13.1% of 1000k tokens, as of 2026-10-20T18:43:43.072Z
+```
+
+It exits 1 when the file is missing or unreadable and 2 when no path is given or configured.
 
 ## Compatibility
 
