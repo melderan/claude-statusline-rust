@@ -70,6 +70,34 @@ pub(crate) struct Config {
     /// `activity: false` or `CSR_ACTIVITY=0` hides it.
     #[serde(default = "default_true")]
     pub(crate) activity: bool,
+    /// Fuel file: each render that has context numbers writes them to this
+    /// path as JSON (`used_pct`, `used_tokens`, `window_tokens`, `session_id`,
+    /// `as_of`, `source`), atomically and mode 0644, so another program can
+    /// see how full the context is. Unset (the default) writes nothing.
+    /// `CSR_FUEL_FILE` overrides; paths expand as `metrics_db` does.
+    #[serde(default)]
+    pub(crate) fuel_file: Option<String>,
+    /// Extra string fields for the fuel file, such as `{"room": "a"}`.
+    /// `CSR_FUEL_LABELS=room=a,house=b` overrides. A label never replaces a
+    /// measured field.
+    #[serde(default, deserialize_with = "fuel_labels_de")]
+    pub(crate) fuel_labels: Vec<(String, String)>,
+}
+
+/// `fuel_labels` from a JSON object of strings; any other shape is no labels,
+/// never a failed config.
+fn fuel_labels_de<'de, D>(d: D) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Longest residue window; past ten turns the line stops being readable.
@@ -112,6 +140,8 @@ impl Default for Config {
             lines: None,
             compact_reserve: None,
             activity: true,
+            fuel_file: None,
+            fuel_labels: Vec::new(),
         }
     }
 }
@@ -160,6 +190,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CSR_ACTIVITY") {
             cfg.activity = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("CSR_FUEL_FILE") {
+            cfg.fuel_file = Some(v);
+        }
+        if let Ok(v) = std::env::var("CSR_FUEL_LABELS") {
+            cfg.fuel_labels = parse_labels(&v);
         }
         cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);
