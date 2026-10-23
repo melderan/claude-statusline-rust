@@ -10,6 +10,7 @@ mod extras;
 mod flush;
 mod fuel;
 mod git;
+mod identity;
 mod input;
 mod lines;
 mod memory;
@@ -27,6 +28,7 @@ use extras::*;
 use flush::*;
 use fuel::*;
 use git::*;
+use identity::*;
 use input::*;
 use lines::*;
 use memory::*;
@@ -181,6 +183,14 @@ fn main() {
         None
     };
 
+    let identity = if cfg.identity {
+        std::env::var("SANDBOX_NAME")
+            .ok()
+            .and_then(|n| parse_identity(&n))
+    } else {
+        None
+    };
+
     let env = Env {
         mode,
         bar_width,
@@ -190,6 +200,7 @@ fn main() {
         git,
         voice,
         activity,
+        identity,
         db_locked,
         now: now_epoch(),
     };

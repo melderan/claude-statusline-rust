@@ -167,6 +167,9 @@ pub(crate) struct Env {
     pub(crate) voice: Option<String>,
     /// The activity line, already read from the transcript tail.
     pub(crate) activity: Option<String>,
+    /// Which sandbox this session runs in, from `SANDBOX_NAME`; the first
+    /// piece of the project row.
+    pub(crate) identity: Option<Identity>,
     /// This render's metrics row was skipped because the database was busy
     /// or locked.
     pub(crate) db_locked: bool,
@@ -292,11 +295,15 @@ fn api_share_percent(cost: &Cost) -> Option<i64> {
     Some((api as f64 * 100.0 / wall as f64).round() as i64)
 }
 
-/// Head: project path (tilde form, with `cd` suffix) and model. Tail: CC
-/// version, duration, lines changed, API share, memory sizes, always-on size.
+/// Head: sandbox identity, project path (tilde form, with `cd` suffix) and
+/// model. Tail: CC version, duration, lines changed, API share, memory
+/// sizes, always-on size.
 fn project_row(data: &Input, cfg: &Config, env: &Env, project_dir: &str, current_dir: &str) -> Row {
     let rst = reset(cfg);
     let mut row = Row::default();
+    if let Some(id) = &env.identity {
+        row.push_head(identity_segment(id, cfg), KEEP);
+    }
     let rel_cur = if !project_dir.is_empty() && !current_dir.is_empty() {
         relative_current(project_dir, current_dir)
     } else {
@@ -304,6 +311,9 @@ fn project_row(data: &Input, cfg: &Config, env: &Env, project_dir: &str, current
     };
     let mut path = String::new();
     if !project_dir.is_empty() {
+        if !row.is_empty() {
+            path.push_str(" | ");
+        }
         path.push_str(&tilde(project_dir));
         if let Some(suffix) = &rel_cur {
             if cfg.glyphs {
@@ -313,12 +323,11 @@ fn project_row(data: &Input, cfg: &Config, env: &Env, project_dir: &str, current
             }
         }
     }
-    let path_empty = path.is_empty();
     row.push_head(path, KEEP);
 
     if let Some(name) = data.model.as_ref().and_then(|m| m.display_name.as_deref()) {
         let short = name.strip_prefix("Claude ").unwrap_or(name);
-        let sep = if path_empty { "" } else { " | " };
+        let sep = if row.is_empty() { "" } else { " | " };
         row.push_head(format!("{sep}{short}"), KEEP);
     }
 
