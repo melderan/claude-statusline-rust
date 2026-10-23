@@ -82,6 +82,12 @@ pub(crate) struct Config {
     /// measured field.
     #[serde(default, deserialize_with = "fuel_labels_de")]
     pub(crate) fuel_labels: Vec<(String, String)>,
+    /// Sandbox identity as the first piece of the project row
+    /// (`claude·sandboxes` from `SANDBOX_NAME=owner--claude--sandboxes`),
+    /// shown only when `SANDBOX_NAME` is set. On by default;
+    /// `identity: false` or `CSR_IDENTITY=0` hides it.
+    #[serde(default = "default_true")]
+    pub(crate) identity: bool,
 }
 
 /// `fuel_labels` from a JSON object of strings; any other shape is no labels,
@@ -142,6 +148,7 @@ impl Default for Config {
             activity: true,
             fuel_file: None,
             fuel_labels: Vec::new(),
+            identity: true,
         }
     }
 }
@@ -196,6 +203,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CSR_FUEL_LABELS") {
             cfg.fuel_labels = parse_labels(&v);
+        }
+        if let Ok(v) = std::env::var("CSR_IDENTITY") {
+            cfg.identity = truthy(&v);
         }
         cfg.apply_metrics_env(std::env::var("CSR_METRICS_DB").ok());
         cfg.residue = serde_json::Value::from(residue_turns(&cfg.residue) as i64);

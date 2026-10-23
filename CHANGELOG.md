@@ -7,6 +7,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Added
 
 - Fuel file: with `fuel_file` or `CSR_FUEL_FILE` set, each render writes the ctx line's context use (`used_pct`, `used_tokens`, `window_tokens`, `session_id`, `as_of`, `source`, plus any `fuel_labels` / `CSR_FUEL_LABELS` fields) to that path as JSON, atomically and mode 0644. A render that matches a file under 60 seconds old skips the write. `claude-statusline-rust --fuel [PATH]` prints it as one line: `fuel: 13.1% of 1000k tokens, as of <UTC>`.
+- Sandbox identity: when `SANDBOX_NAME` is set, the project line starts with it, so two sessions side by side can be told apart at a glance. `owner--claude--app` shows `claude·app`, bold, in a fixed colour for the `claude` and `gpt` groups (256-colour 208 and 141). A leading `claude-code-` is dropped from the name, and a name with fewer than three `--` fields is shown whole. A control character in the name shows as `?`. One-line mode never drops it. `identity: false` or `CSR_IDENTITY=0` hides it.
 
 ## [1.2.0] - 2026-10-10
 

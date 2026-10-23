@@ -88,6 +88,8 @@ The program reads `COLUMNS` from its environment (80 when unset). Below 60 colum
 ~/code/my-app | cd:src | Fable 5.1 | CC:2.1.292 | dur:1h12m | +288 -47 | api:11% | mem:2KB+9KB | on:4.8kch
 ```
 
+Inside a sandbox (`SANDBOX_NAME` set), the line starts with the sandbox identity, such as `claude·my-app | ~/code/my-app | ...`; see `identity` under Configuration.
+
 - `~/code/my-app`: `workspace.project_dir`, with your home directory written as `~`.
 - `cd:src`: where `workspace.current_dir` sits inside the project. Outside the project it shows the full path. Hidden when the two are equal.
 - `Fable 5.1`: `model.display_name` without a leading "Claude ".
@@ -173,7 +175,7 @@ When this render's metrics row was skipped because the database was busy or lock
 ~/code/my-app | Opus 4.6 | CC:2.1.0 | dur:1h02m | ctx 43% (86k/200k) | $1.23 | git: main (3h) *
 ```
 
-Set `lines` to `one` (or `CSR_LINES=one`) and every line above is joined into a single row with ` | `, in the same order. When the row is wider than `COLUMNS`, pieces are dropped from the least important up until it fits: the residue numbers first, then the 7d and 5h windows, the activity line, the misc tags, the `db:locked` marker, the tail of the ctx line (cache, then `last in/out`, then cost), the tail of the project line (version, memory, always-on size, duration, lines changed, API share), and the tail of the git line (age, then PR state). The project path and model, the ctx percentage and the branch stay the longest; the project path is never dropped, so on a very narrow terminal it is clipped rather than lost. The default `multi` prints one line per kind of information as shown above.
+Set `lines` to `one` (or `CSR_LINES=one`) and every line above is joined into a single row with ` | `, in the same order. When the row is wider than `COLUMNS`, pieces are dropped from the least important up until it fits: the residue numbers first, then the 7d and 5h windows, the activity line, the misc tags, the `db:locked` marker, the tail of the ctx line (cache, then `last in/out`, then cost), the tail of the project line (version, memory, always-on size, duration, lines changed, API share), and the tail of the git line (age, then PR state). The project path and model, the ctx percentage and the branch stay the longest; the sandbox identity and the project path are never dropped, so on a very narrow terminal it is clipped rather than lost. The default `multi` prints one line per kind of information as shown above.
 
 ## Configuration
 
@@ -194,6 +196,7 @@ Settings come from `~/.config/claude-statusline-rust/config.json`, then environm
 | `compact_reserve` | `CSR_COMPACT_RESERVE` | `33000` | Tokens kept free at the compaction point; negative turns the `compact in` marker off. |
 | `fuel_file` | `CSR_FUEL_FILE` | unset | Path of a fuel file; see Fuel file. |
 | `fuel_labels` | `CSR_FUEL_LABELS` | none | Extra string fields for the fuel file: a JSON object in the config file, `key=value,key=value` in the variable. |
+| `identity` | `CSR_IDENTITY` | `true` | The sandbox identity at the start of the project line, when `SANDBOX_NAME` is set: `owner--claude--app` shows `claude·app` in bold, orange for `claude` and purple for `gpt`. A leading `claude-code-` is dropped from the last field. A name with fewer than three `--` fields is shown whole. It is never dropped in one-line mode. |
 
 ## Metrics database
 

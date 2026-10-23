@@ -199,6 +199,30 @@ fn first_renders_of_a_new_file_all_write() {
 }
 
 #[test]
+fn sandbox_identity_leads_the_line_and_switches_off() {
+    let dir = fresh_dir("identity");
+    let (_, plain, _) = run(&dir, &[("CSR_LINES", "one")], &[], HOOK);
+    assert!(plain.starts_with("/x | Fable"), "{plain}");
+
+    let sandbox = [("CSR_LINES", "one"), ("SANDBOX_NAME", "o--gpt--app")];
+    let (code, with, _) = run(&dir, &sandbox, &[], HOOK);
+    assert_eq!(code, 0);
+    assert!(with.starts_with("gpt\u{b7}app | /x | Fable"), "{with}");
+
+    let mut off = sandbox.to_vec();
+    off.push(("CSR_IDENTITY", "0"));
+    let (_, hidden, _) = run(&dir, &off, &[], HOOK);
+    assert_eq!(hidden, plain, "CSR_IDENTITY=0 gives the line as it was");
+
+    let cfg = dir.join(".config/claude-statusline-rust");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.json"), r#"{"identity": false}"#).unwrap();
+    let (_, hidden, _) = run(&dir, &sandbox, &[], HOOK);
+    assert_eq!(hidden, plain, "identity: false in the config file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn lines_and_compact_env_reach_the_render() {
     let dir = fresh_dir("linesenv");
     let (_, multi, _) = run(&dir, &[], &[], HOOK);
